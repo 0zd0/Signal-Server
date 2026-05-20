@@ -66,22 +66,21 @@ public class RegistrationServiceClient implements Managed {
 
   public RegistrationServiceClient(final String host,
       final int port,
-      final CallCredentials callCredentials,
-      final String caCertificatePem,
+      final ChannelCredentials channelCredentials,
+      @Nullable final CallCredentials callCredentials,
       final byte[] collationKeySalt,
-      final Executor callbackExecutor) throws IOException {
+      final Executor callbackExecutor) {
 
-    try (final ByteArrayInputStream certificateInputStream = new ByteArrayInputStream(caCertificatePem.getBytes(StandardCharsets.UTF_8))) {
-      final ChannelCredentials tlsChannelCredentials = TlsChannelCredentials.newBuilder()
-          .trustManager(certificateInputStream)
-          .build();
+    this.channel = Grpc.newChannelBuilderForAddress(host, port, channelCredentials)
+        .idleTimeout(1, TimeUnit.MINUTES)
+        .build();
 
-      this.channel = Grpc.newChannelBuilderForAddress(host, port, tlsChannelCredentials)
-          .idleTimeout(1, TimeUnit.MINUTES)
-          .build();
-    }
+    final RegistrationServiceGrpc.RegistrationServiceFutureStub baseStub =
+        RegistrationServiceGrpc.newFutureStub(channel);
 
-    this.stub = RegistrationServiceGrpc.newFutureStub(channel).withCallCredentials(callCredentials);
+    this.stub = callCredentials == null
+        ? baseStub
+        : baseStub.withCallCredentials(callCredentials);
     this.collationKeySalt = collationKeySalt;
     this.callbackExecutor = callbackExecutor;
 
@@ -90,6 +89,24 @@ public class RegistrationServiceClient implements Managed {
       getInitializedMac(collationKeySalt);
     } catch (final InvalidKeyException e) {
       throw new IllegalArgumentException(e);
+    }
+  }
+
+  public RegistrationServiceClient(final String host,
+      final int port,
+      @Nullable final CallCredentials callCredentials,
+      final String caCertificatePem,
+      final byte[] collationKeySalt,
+      final Executor callbackExecutor) throws IOException {
+
+    this(host, port, buildTlsChannelCredentials(caCertificatePem), callCredentials, collationKeySalt, callbackExecutor);
+  }
+
+  private static ChannelCredentials buildTlsChannelCredentials(final String caCertificatePem) throws IOException {
+    try (final ByteArrayInputStream certificateInputStream = new ByteArrayInputStream(caCertificatePem.getBytes(StandardCharsets.UTF_8))) {
+      return TlsChannelCredentials.newBuilder()
+          .trustManager(certificateInputStream)
+          .build();
     }
   }
 
