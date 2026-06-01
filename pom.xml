@@ -15,9 +15,9 @@
       </snapshots>
     </repository>
     <repository>
-      <id>signal-build-artifacts</id>
-      <name>Signal Build Artifacts</name>
-      <url>https://build-artifacts.signal.org/libraries/maven</url>
+      <id>letknowmessenger-maven</id>
+      <name>LetKnowMessenger Build Artifacts</name>
+      <url>https://letknowmessenger-598120810919.d.codeartifact.ap-southeast-1.amazonaws.com/maven/maven/</url>
       <snapshots>
         <enabled>false</enabled>
       </snapshots>
