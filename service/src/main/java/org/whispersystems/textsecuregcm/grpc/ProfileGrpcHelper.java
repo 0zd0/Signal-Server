@@ -72,7 +72,7 @@ public class ProfileGrpcHelper {
       } else {
         responseBuilder.setDataEtag(DataEtag.newBuilder()
             .setData(ByteString.copyFrom(p.data()))
-            .setEtag(ByteString.copyFrom(p.dataHash()))
+            .setEtagSha256(ByteString.copyFrom(p.dataHash()))
             .build());
       }
     });
@@ -95,7 +95,7 @@ public class ProfileGrpcHelper {
 
     // Include payment address if the version matches the latest version on Account or the latest version on Account
     // is empty
-    if (account.getCurrentProfileVersion().map(v -> v.equals(HexFormat.of().formatHex(requestVersion))).orElse(true)) {
+    if (account.getCurrentProfileVersion().map(v -> Arrays.equals(v, requestVersion)).orElse(true)) {
       final Optional<byte []> paymentAddress = profile.map(VersionedProfile::paymentAddress).or(() -> v1Profile.map(VersionedProfileV1::paymentAddress));
 
       if (paymentAddress.isPresent()) {
@@ -110,7 +110,7 @@ public class ProfileGrpcHelper {
         } else {
           responseBuilder.setPaymentAddressDataEtag(DataEtag.newBuilder()
               .setData(ByteString.copyFrom(paymentAddress.get()))
-              .setEtag(ByteString.copyFrom(
+              .setEtagSha256(ByteString.copyFrom(
                   profile.map(VersionedProfile::paymentAddressHash).orElseGet(() -> hash(paymentAddress.get()))))
               .build());
         }

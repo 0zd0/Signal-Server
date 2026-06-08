@@ -31,21 +31,25 @@ import io.lettuce.core.metrics.MicrometerOptions;
 import io.lettuce.core.resource.ClientResources;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.binder.jvm.ExecutorServiceMetrics;
+import io.netty.channel.DefaultEventLoopGroup;
+import io.netty.channel.local.LocalAddress;
+import io.netty.channel.local.LocalServerChannel;
+import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.ssl.SslContext;
 import io.netty.resolver.ResolvedAddressTypes;
 import io.netty.resolver.dns.DnsNameResolver;
 import io.netty.resolver.dns.DnsNameResolverBuilder;
+import io.netty.util.Mapping;
 import jakarta.servlet.DispatcherType;
-import jakarta.servlet.Filter;
-import jakarta.servlet.ServletRegistration;
 import java.io.ByteArrayInputStream;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.net.http.HttpClient;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.List;
@@ -60,9 +64,9 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.Function;
 import java.util.stream.Stream;
+import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.eclipse.jetty.websocket.core.WebSocketExtensionRegistry;
 import org.eclipse.jetty.websocket.core.server.WebSocketServerComponents;
-import org.eclipse.jetty.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.glassfish.jersey.server.ServerProperties;
 import org.signal.i18n.HeaderControlledResourceBundleLookup;
 import org.signal.libsignal.zkgroup.GenericServerSecretParams;
@@ -135,10 +139,12 @@ import org.whispersystems.textsecuregcm.currency.CurrencyConversionManager;
 import org.whispersystems.textsecuregcm.currency.FixerClient;
 import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.filters.ExternalRequestFilter;
+import org.whispersystems.textsecuregcm.filters.PriorityFilter;
 import org.whispersystems.textsecuregcm.filters.RemoteAddressFilter;
 import org.whispersystems.textsecuregcm.filters.RemoteDeprecationFilter;
 import org.whispersystems.textsecuregcm.filters.RequestStatisticsFilter;
 import org.whispersystems.textsecuregcm.filters.RestDeprecationFilter;
+import org.whispersystems.textsecuregcm.filters.StripContentLengthOnConnectFilter;
 import org.whispersystems.textsecuregcm.filters.TimestampResponseFilter;
 import org.whispersystems.textsecuregcm.grpc.AccountsAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.AccountsGrpcService;
@@ -146,6 +152,7 @@ import org.whispersystems.textsecuregcm.grpc.AttachmentsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.BackupsAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.BackupsGrpcService;
 import org.whispersystems.textsecuregcm.grpc.CallQualitySurveyGrpcService;
+import org.whispersystems.textsecuregcm.grpc.ChallengeGrpcService;
 import org.whispersystems.textsecuregcm.grpc.DevicesGrpcService;
 import org.whispersystems.textsecuregcm.grpc.ErrorConformanceInterceptor;
 import org.whispersystems.textsecuregcm.grpc.ErrorMappingInterceptor;
@@ -159,10 +166,15 @@ import org.whispersystems.textsecuregcm.grpc.MessagesAnonymousGrpcService;
 import org.whispersystems.textsecuregcm.grpc.MessagesGrpcService;
 import org.whispersystems.textsecuregcm.grpc.MetricServerInterceptor;
 import org.whispersystems.textsecuregcm.grpc.PaymentsGrpcService;
+import org.whispersystems.textsecuregcm.grpc.ProfileAnonymousGrpcService;
+import org.whispersystems.textsecuregcm.grpc.ProfileGrpcService;
 import org.whispersystems.textsecuregcm.grpc.RequestAttributesInterceptor;
 import org.whispersystems.textsecuregcm.grpc.ValidatingInterceptor;
 import org.whispersystems.textsecuregcm.grpc.net.ManagedGrpcServer;
-import org.whispersystems.textsecuregcm.grpc.net.ManagedNioEventLoopGroup;
+import org.whispersystems.textsecuregcm.grpc.net.ManagedEventLoopGroup;
+import org.whispersystems.textsecuregcm.grpc.net.OmnibusH2Server;
+import org.whispersystems.textsecuregcm.grpc.net.OmnibusRouter;
+import org.whispersystems.textsecuregcm.grpc.net.SniMapper;
 import org.whispersystems.textsecuregcm.jetty.JettyHttpConfigurationCustomizer;
 import org.whispersystems.textsecuregcm.keytransparency.KeyTransparencyServiceClient;
 import org.whispersystems.textsecuregcm.limits.CardinalityEstimator;
@@ -191,7 +203,7 @@ import org.whispersystems.textsecuregcm.metrics.BackupMetrics;
 import org.whispersystems.textsecuregcm.metrics.CallQualitySurveyManager;
 import org.whispersystems.textsecuregcm.metrics.MessageMetrics;
 import org.whispersystems.textsecuregcm.metrics.MetricsApplicationEventListener;
-import org.whispersystems.textsecuregcm.metrics.MetricsHttpChannelListener;
+import org.whispersystems.textsecuregcm.metrics.MetricsHttpEventHandler;
 import org.whispersystems.textsecuregcm.metrics.MetricsUtil;
 import org.whispersystems.textsecuregcm.metrics.MicrometerAwsSdkMetricPublisher;
 import org.whispersystems.textsecuregcm.metrics.ReportedMessageMetricsListener;
@@ -224,6 +236,8 @@ import org.whispersystems.textsecuregcm.storage.AccountLockManager;
 import org.whispersystems.textsecuregcm.storage.Accounts;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.storage.ChangeNumberManager;
+import org.whispersystems.textsecuregcm.storage.ChangeNumberWaitingPeriodManager;
+import org.whispersystems.textsecuregcm.storage.ChangeNumberWaitingPeriods;
 import org.whispersystems.textsecuregcm.storage.ClientReleaseManager;
 import org.whispersystems.textsecuregcm.storage.ClientReleases;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
@@ -285,6 +299,7 @@ import org.whispersystems.textsecuregcm.workers.BackupUsageRecalculationCommand;
 import org.whispersystems.textsecuregcm.workers.CertificateCommand;
 import org.whispersystems.textsecuregcm.workers.CheckDynamicConfigurationCommand;
 import org.whispersystems.textsecuregcm.workers.ClearIssuedReceiptRedemptionsCommand;
+import org.whispersystems.textsecuregcm.workers.CopyToS3Command;
 import org.whispersystems.textsecuregcm.workers.DeleteUserCommand;
 import org.whispersystems.textsecuregcm.workers.IdleDeviceNotificationSchedulerFactory;
 import org.whispersystems.textsecuregcm.workers.MessagePersisterServiceCommand;
@@ -312,6 +327,7 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.dynamodb.DynamoDbAsyncClient;
 import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
+import javax.annotation.Nullable;
 
 public class WhisperServerService extends Application<WhisperServerConfiguration> {
 
@@ -357,6 +373,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     bootstrap.addCommand(new UnlinkDevicesWithIdlePrimaryCommand(Clock.systemUTC()));
     bootstrap.addCommand(new NotifyIdleDevicesCommand());
     bootstrap.addCommand(new ClearIssuedReceiptRedemptionsCommand());
+    bootstrap.addCommand(new CopyToS3Command());
 
     bootstrap.addCommand(new ProcessScheduledJobsServiceCommand("process-idle-device-notification-jobs",
         "Processes scheduled jobs to send notifications to idle devices",
@@ -502,10 +519,10 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     RegistrationRecoveryPasswords registrationRecoveryPasswords = new RegistrationRecoveryPasswords(
         config.getDynamoDbTables().getRegistrationRecovery().getTableName(),
         config.getDynamoDbTables().getRegistrationRecovery().getExpiration(),
-        dynamoDbAsyncClient,
+        dynamoDbClient,
         clock);
 
-    final VerificationSessions verificationSessions = new VerificationSessions(dynamoDbAsyncClient,
+    final VerificationSessions verificationSessions = new VerificationSessions(dynamoDbClient,
         config.getDynamoDbTables().getVerificationSessions().getTableName(), clock);
 
     final ClientResources sharedClientResources = ClientResources.builder()
@@ -615,10 +632,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     ScheduledExecutorService cloudflareTurnRetryExecutor = ScheduledExecutorServiceBuilder.of(environment, "cloudflareTurnRetry").threads(1).build();
     ScheduledExecutorService messagePollExecutor = ScheduledExecutorServiceBuilder.of(environment, "messagePollExecutor").threads(1).build();
     ScheduledExecutorService provisioningWebsocketTimeoutExecutor = ScheduledExecutorServiceBuilder.of(environment, "provisioningWebsocketTimeout").threads(1).build();
-    ScheduledExecutorService jmxDumper = ScheduledExecutorServiceBuilder.of(environment, "jmxDumper").threads(1).build();
 
-    final ManagedNioEventLoopGroup dnsResolutionEventLoopGroup = new ManagedNioEventLoopGroup();
-    final DnsNameResolver cloudflareDnsResolver = new DnsNameResolverBuilder(dnsResolutionEventLoopGroup.next())
+    final ManagedEventLoopGroup<NioEventLoopGroup> dnsResolutionEventLoopGroup = new ManagedEventLoopGroup<>(new NioEventLoopGroup());
+    final DnsNameResolver cloudflareDnsResolver = new DnsNameResolverBuilder(dnsResolutionEventLoopGroup.getEventLoopGroup().next())
             .resolvedAddressTypes(ResolvedAddressTypes.IPV6_PREFERRED)
             .completeOncePreferredResolved(false)
             .channelType(NioDatagramChannel.class)
@@ -694,15 +710,19 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new RedisMessageAvailabilityManager(messagesCluster, clientEventExecutor, asyncOperationQueueingExecutor);
     MessagesManager messagesManager = new MessagesManager(messagesDynamoDb, messagesCache, redisMessageAvailabilityManager,
         reportMessageManager, messageDeletionAsyncExecutor, Clock.systemUTC());
+    final ChangeNumberWaitingPeriods changeNumberWaitingPeriods = new ChangeNumberWaitingPeriods(
+        config.getDynamoDbTables().getChangeNumberWaitingPeriods().getTableName(), dynamoDbClient);
+    final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager = new ChangeNumberWaitingPeriodManager(
+        changeNumberWaitingPeriods, config.getChangeNumber().postRegistrationWaitingPeriod(), clock);
     AccountLockManager accountLockManager = new AccountLockManager(dynamoDbClient,
         config.getDynamoDbTables().getDeletedAccountsLock().getTableName());
     AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
         pubsubClient, accountLockManager, keysManager, messagesManager, profilesManager,
-        secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
+        changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
         registrationRecoveryPasswordsManager, accountLockExecutor, messagePollExecutor,
         retryExecutor, clock, config.getLinkDeviceSecretConfiguration().secret().value());
     RemoteConfigsManager remoteConfigsManager = new RemoteConfigsManager(remoteConfigs);
-    APNSender apnSender = new APNSender(apnSenderExecutor, config.getApnConfiguration());
+    APNSender apnSender = new APNSender(apnSenderExecutor, Clock.systemUTC(), config.getApnConfiguration());
     FcmSender fcmSender = new FcmSender(fcmSenderExecutor, config.getFcmConfiguration().credentials().value());
     PushNotificationScheduler pushNotificationScheduler = new PushNotificationScheduler(pushSchedulerCluster,
         apnSender, fcmSender, accountsManager, 0, 0, retryExecutor);
@@ -720,10 +740,10 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         config.getDynamoDbTables().getOnetimeDonations().getTableName(), config.getDynamoDbTables().getOnetimeDonations().getExpiration(), dynamoDbAsyncClient);
     RedeemedReceiptsManager redeemedReceiptsManager = new RedeemedReceiptsManager(clock,
         config.getDynamoDbTables().getRedeemedReceipts().getTableName(),
-        dynamoDbAsyncClient,
+        dynamoDbClient,
         config.getDynamoDbTables().getRedeemedReceipts().getExpiration());
     Subscriptions subscriptions = new Subscriptions(
-        config.getDynamoDbTables().getSubscriptions().getTableName(), dynamoDbAsyncClient);
+        config.getDynamoDbTables().getSubscriptions().getTableName(), dynamoDbClient);
     MessageDeliveryLoopMonitor messageDeliveryLoopMonitor =
         config.logMessageDeliveryLoops() ? new RedisMessageDeliveryLoopMonitor(rateLimitersCluster) : new NoopMessageDeliveryLoopMonitor();
     CallQualitySurveyManager callQualitySurveyManager = new CallQualitySurveyManager(asnInfoProviderSupplier,
@@ -741,7 +761,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
 
     final AccountAuthenticator accountAuthenticator = new AccountAuthenticator(accountsManager);
 
-    final MessageSender messageSender = new MessageSender(messagesManager, pushNotificationManager);
+    final MessageSender messageSender = new MessageSender(messagesManager, pushNotificationManager, dynamicConfigurationManager);
     final ReceiptSender receiptSender = new ReceiptSender(accountsManager, messageSender, receiptSenderExecutor);
     final CloudflareTurnCredentialsManager cloudflareTurnCredentialsManager = new CloudflareTurnCredentialsManager(
         config.getTurnConfiguration().cloudflare().apiToken().value(),
@@ -970,11 +990,14 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             new AccountsGrpcService(accountsManager, rateLimiters, usernameHashZkProofVerifier, registrationRecoveryPasswordsManager),
             ExternalServiceCredentialsGrpcService.createForAllExternalServices(config, rateLimiters),
             new KeysGrpcService(accountsManager, keysManager, rateLimiters),
+            new ProfileGrpcService(clock, accountsManager, profilesManager, dynamicConfigurationManager, config.getBadges(), profileCdnPolicyGenerator, profileCdnPolicySigner, profileBadgeConverter, rateLimiters),
             new MessagesGrpcService(accountsManager, rateLimiters, messageSender, messageByteLimitCardinalityEstimator, spamChecker, Clock.systemUTC()),
             new BackupsGrpcService(accountsManager, backupAuthManager, backupMetrics),
             new DevicesGrpcService(accountsManager),
             new AttachmentsGrpcService(experimentEnrollmentManager, rateLimiters,
-                gcsAttachmentGenerator, tusAttachmentGenerator, config.getAttachments().maxUploadSizeInBytes()))
+                gcsAttachmentGenerator, tusAttachmentGenerator, config.getAttachments().maxAttachmentUploadSizeInBytes()),
+            new PaymentsGrpcService(currencyManager),
+            new ChallengeGrpcService(accountsManager, rateLimitChallengeManager, challengeConstraintChecker))
         .map(bindableService -> ServerInterceptors.intercept(bindableService,
             // Note: interceptors run in the reverse order they are added; the remote deprecation filter
             // depends on the user-agent context so it has to come first here!
@@ -991,9 +1014,9 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             new AccountsAnonymousGrpcService(accountsManager, rateLimiters),
             new CallQualitySurveyGrpcService(callQualitySurveyManager, rateLimiters),
             new KeysAnonymousGrpcService(accountsManager, keysManager, zkSecretParams, Clock.systemUTC()),
-            new PaymentsGrpcService(currencyManager),
+            new ProfileAnonymousGrpcService(accountsManager, profilesManager, profileBadgeConverter, zkSecretParams),
             new MessagesAnonymousGrpcService(accountsManager, rateLimiters, messageSender, groupSendTokenUtil, messageByteLimitCardinalityEstimator, spamChecker, Clock.systemUTC()),
-            new BackupsAnonymousGrpcService(backupManager, backupMetrics, config.getAttachments().maxUploadSizeInBytes()),
+            new BackupsAnonymousGrpcService(backupManager, backupMetrics, config.getAttachments().maxAttachmentUploadSizeInBytes(), config.getAttachments().maxMessageBackupUploadSizeInBytes()),
             ExternalServiceCredentialsAnonymousGrpcService.create(accountsManager, config))
         .map(bindableService -> ServerInterceptors.intercept(bindableService,
             // Note: interceptors run in the reverse order they are added; the remote deprecation filter
@@ -1009,24 +1032,38 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             prohibitAuthenticationInterceptor))
         .toList();
 
-    final ServerBuilder<?> serverBuilder =
-        NettyServerBuilder.forAddress(new InetSocketAddress(config.getGrpc().bindAddress(), config.getGrpc().port()));
+    final ManagedEventLoopGroup<DefaultEventLoopGroup> omnibusLocalEventLoopGroup = new ManagedEventLoopGroup<>(new DefaultEventLoopGroup());
+    final ManagedEventLoopGroup<NioEventLoopGroup> omnibusNioEventLoopGroup = new ManagedEventLoopGroup<>(new NioEventLoopGroup());
+    final LocalAddress grpcLocalAddress = new LocalAddress("grpc");
+    final ServerBuilder<?> serverBuilder = NettyServerBuilder
+        .forAddress(grpcLocalAddress)
+        .channelType(LocalServerChannel.class)
+        .bossEventLoopGroup(omnibusLocalEventLoopGroup.getEventLoopGroup())
+        .workerEventLoopGroup(omnibusLocalEventLoopGroup.getEventLoopGroup());
     authenticatedServices.forEach(serverBuilder::addService);
     unauthenticatedServices.forEach(serverBuilder::addService);
-    final ManagedGrpcServer exposedGrpcServer = new ManagedGrpcServer(serverBuilder.build());
+    final ManagedGrpcServer localGrpcServer = new ManagedGrpcServer(serverBuilder.build());
 
-    environment.lifecycle().manage(exposedGrpcServer);
+    final SocketAddress websocketAddress =
+        new InetSocketAddress(config.getGrpc().websocketAddress(), config.getGrpc().websocketPort());
+    final OmnibusRouter omnibusRouter = new OmnibusRouter(List.of(
+        new OmnibusRouter.OmnibusRoute("/v1/websocket", websocketAddress),
+        new OmnibusRouter.OmnibusRoute("/v1/provisioning", websocketAddress)),
+        grpcLocalAddress);
+    @Nullable final Mapping<String, SslContext> sniMapping = config.getGrpc().h2c()
+        ? null
+        : SniMapper.buildSniMapping(config.getTlsKeyStoreConfiguration().path(), config.getTlsKeyStoreConfiguration().password().value());
+    final OmnibusH2Server omnibusH2Server = new OmnibusH2Server(
+        sniMapping,
+        omnibusNioEventLoopGroup.getEventLoopGroup(),
+        omnibusLocalEventLoopGroup.getEventLoopGroup(),
+        new InetSocketAddress(config.getGrpc().bindAddress(), config.getGrpc().port()), omnibusRouter,
+        config.getGrpc().idleTimeout());
 
-    final List<Filter> filters = new ArrayList<>();
-    filters.add(remoteDeprecationFilter);
-    filters.add(new RemoteAddressFilter());
-    filters.add(new TimestampResponseFilter());
-
-    for (Filter filter : filters) {
-      environment.servlets()
-          .addFilter(filter.getClass().getSimpleName(), filter)
-          .addMappingForUrlPatterns(EnumSet.of(DispatcherType.REQUEST), false, "/*");
-    }
+    environment.lifecycle().manage(omnibusLocalEventLoopGroup);
+    environment.lifecycle().manage(omnibusNioEventLoopGroup);
+    environment.lifecycle().manage(localGrpcServer);
+    environment.lifecycle().manage(omnibusH2Server);
 
     if (!config.getExternalRequestFilterConfiguration().paths().isEmpty()) {
       environment.servlets().addFilter(ExternalRequestFilter.class.getSimpleName(),
@@ -1044,9 +1081,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     final String websocketServletPath = "/v1/websocket/";
     final String provisioningWebsocketServletPath = "/v1/websocket/provisioning/";
 
-    final MetricsHttpChannelListener metricsHttpChannelListener = new MetricsHttpChannelListener(clientReleaseManager,
-        Set.of(websocketServletPath, provisioningWebsocketServletPath, "/health-check"));
-    metricsHttpChannelListener.configure(environment);
+    MetricsHttpEventHandler.configure(environment, Metrics.globalRegistry, clientReleaseManager, Set.of(websocketServletPath, provisioningWebsocketServletPath, "/health-check"));
     final MessageMetrics messageMetrics = new MessageMetrics();
 
     // BufferingInterceptor is needed on the base environment but not the WebSocketEnvironment,
@@ -1092,15 +1127,16 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         phoneNumberIdentifiers, registrationServiceClient, registrationRecoveryPasswordsManager, registrationRecoveryChecker);
 
     final ChangeNumberManager changeNumberManager = new ChangeNumberManager(messageSender, accountsManager,
-        phoneVerificationTokenManager, registrationLockVerificationManager, rateLimiters, Clock.systemUTC());
+        phoneVerificationTokenManager, registrationLockVerificationManager, rateLimiters,
+        changeNumberWaitingPeriodManager, Clock.systemUTC());
 
     final List<Object> commonControllers = Lists.newArrayList(
         new AccountController(accountsManager, rateLimiters, registrationRecoveryPasswordsManager,
             usernameHashZkProofVerifier),
         new AccountControllerV2(accountsManager, changeNumberManager),
         new AttachmentControllerV4(rateLimiters, gcsAttachmentGenerator, tusAttachmentGenerator,
-            experimentEnrollmentManager, config.getAttachments().maxUploadSizeInBytes()),
-        new ArchiveController(accountsManager, backupAuthManager, backupManager, backupMetrics, config.getAttachments().maxUploadSizeInBytes()),
+            experimentEnrollmentManager, config.getAttachments().maxAttachmentUploadSizeInBytes()),
+        new ArchiveController(accountsManager, backupAuthManager, backupManager, backupMetrics, config.getAttachments().maxAttachmentUploadSizeInBytes(), config.getAttachments().maxMessageBackupUploadSizeInBytes()),
         new CallRoutingControllerV2(rateLimiters, cloudflareTurnCredentialsManager),
         new CallLinkController(rateLimiters, callingGenericZkSecretParams),
         new CallQualitySurveyController(callQualitySurveyManager),
@@ -1117,11 +1153,8 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             ReceiptCredentialPresentation::new),
         new KeysController(rateLimiters, keysManager, accountsManager, zkSecretParams, Clock.systemUTC()),
         new KeyTransparencyController(keyTransparencyServiceClient),
-        new MessageController(rateLimiters, messageByteLimitCardinalityEstimator, messageSender,
-            accountsManager, messagesManager, phoneNumberIdentifiers, pushNotificationManager, pushNotificationScheduler,
-            reportMessageManager, messageDeliveryScheduler, clientReleaseManager,
-            zkSecretParams, spamChecker, messageMetrics, messageDeliveryLoopMonitor,
-            Clock.systemUTC()),
+        new MessageController(rateLimiters, messageByteLimitCardinalityEstimator, messageSender, accountsManager,
+            phoneNumberIdentifiers, reportMessageManager, zkSecretParams, spamChecker, Clock.systemUTC()),
         new PaymentsController(currencyManager, paymentsCredentialsGenerator),
         new ProfileController(clock, rateLimiters, accountsManager, profilesManager, dynamicConfigurationManager,
             profileBadgeConverter, config.getBadges(), profileCdnPolicyGenerator, profileCdnPolicySigner,
@@ -1129,7 +1162,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new ProvisioningController(rateLimiters, provisioningManager),
         new RegistrationController(accountsManager, phoneVerificationTokenManager, registrationLockVerificationManager,
             rateLimiters, registrationFraudChecker),
-        new RemoteConfigController(remoteConfigsManager, config.getRemoteConfigConfiguration().globalConfig(), clock),
+        new RemoteConfigController(remoteConfigsManager, config.getRemoteConfigConfiguration().globalConfig()),
         new SecureStorageController(storageCredentialsGenerator),
         new SecureValueRecovery2Controller(svr2CredentialsGenerator, accountsManager),
         new StickerController(rateLimiters, config.getCdnConfiguration().credentials().accessKeyId().value(),
@@ -1138,7 +1171,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
         new VerificationController(registrationServiceClient, new VerificationSessionManager(verificationSessions),
             pushNotificationManager, registrationCaptchaManager, registrationRecoveryPasswordsManager,
             phoneNumberIdentifiers, rateLimiters, accountsManager, carrierDataProvider, registrationFraudChecker,
-            dynamicConfigurationManager, clock)
+            dynamicConfigurationManager, experimentEnrollmentManager, clock)
     );
     if (config.getSubscription() != null && config.getOneTimeDonations() != null) {
       SubscriptionManager subscriptionManager = new SubscriptionManager(subscriptions,
@@ -1169,36 +1202,36 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     webSocketEnvironment.jersey().property(ServerProperties.UNWRAP_COMPLETION_STAGE_IN_WRITER_ENABLE, Boolean.TRUE);
     provisioningEnvironment.jersey().property(ServerProperties.UNWRAP_COMPLETION_STAGE_IN_WRITER_ENABLE, Boolean.TRUE);
 
-    JettyWebSocketServletContainerInitializer.configure(environment.getApplicationContext(), (context, container) -> {
-      final WebSocketExtensionRegistry extensionRegistry = WebSocketServerComponents
-          .getWebSocketComponents(environment.getApplicationContext().getServletContext())
-          .getExtensionRegistry();
-      if (config.getWebSocketConfiguration().isDisablePerMessageDeflate()) {
-        extensionRegistry.unregister("permessage-deflate");
-      } else if (config.getWebSocketConfiguration().isDisableCrossMessageOutgoingCompression()) {
-        extensionRegistry.unregister("permessage-deflate");
-        extensionRegistry.register("permessage-deflate", NoContextTakeoverPerMessageDeflateExtension.class);
-      }
-    });
-
     WebSocketResourceProviderFactory<AuthenticatedDevice> webSocketServlet = new WebSocketResourceProviderFactory<>(
-        webSocketEnvironment, AuthenticatedDevice.class, config.getWebSocketConfiguration(),
-        RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
+        webSocketEnvironment, AuthenticatedDevice.class, RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
     WebSocketResourceProviderFactory<AuthenticatedDevice> provisioningServlet = new WebSocketResourceProviderFactory<>(
-        provisioningEnvironment, AuthenticatedDevice.class, config.getWebSocketConfiguration(),
-        RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
+        provisioningEnvironment, AuthenticatedDevice.class, RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
 
-    ServletRegistration.Dynamic websocket = environment.servlets().addServlet("WebSocket", webSocketServlet);
-    ServletRegistration.Dynamic provisioning = environment.servlets().addServlet("Provisioning", provisioningServlet);
+    JettyWebSocketServletContainerInitializer.configure(environment.getApplicationContext(),
+        (servletContext, container) -> {
+          container.addMapping(websocketServletPath, webSocketServlet);
+          container.addMapping(provisioningWebsocketServletPath, provisioningServlet);
 
-    websocket.addMapping(websocketServletPath);
-    websocket.setAsyncSupported(true);
+          PriorityFilter.ensureFilter(servletContext, new StripContentLengthOnConnectFilter());
+          PriorityFilter.ensureFilter(servletContext, new TimestampResponseFilter());
+          PriorityFilter.ensureFilter(servletContext, new RemoteAddressFilter());
+          PriorityFilter.ensureFilter(servletContext, remoteDeprecationFilter);
 
-    provisioning.addMapping(provisioningWebsocketServletPath);
-    provisioning.setAsyncSupported(true);
+          container.setMaxBinaryMessageSize(config.getWebSocketConfiguration().getMaxBinaryMessageSize());
+          container.setMaxTextMessageSize(config.getWebSocketConfiguration().getMaxTextMessageSize());
+
+          final WebSocketExtensionRegistry extensionRegistry = WebSocketServerComponents
+              .getWebSocketComponents(environment.getApplicationContext())
+              .getExtensionRegistry();
+          if (config.getWebSocketConfiguration().isDisablePerMessageDeflate()) {
+            extensionRegistry.unregister("permessage-deflate");
+          } else if (config.getWebSocketConfiguration().isDisableCrossMessageOutgoingCompression()) {
+            extensionRegistry.unregister("permessage-deflate");
+            extensionRegistry.register("permessage-deflate", NoContextTakeoverPerMessageDeflateExtension.class);
+          }
+        });
 
     environment.admin().addTask(new SetRequestLoggingEnabledTask());
-
   }
 
   private void registerExceptionMappers(Environment environment,

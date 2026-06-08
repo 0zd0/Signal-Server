@@ -266,6 +266,99 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
   }
 
   @Test
+  void setProfileExpectedDataWriteConflict() throws Exception {
+    final byte[] commitment = new ProfileKey(new byte[32]).getCommitment(new ServiceId.Aci(AUTHENTICATED_ACI)).serialize();
+    final byte[] validAboutEmoji = new byte[60];
+    final byte[] validAbout = new byte[540];
+    final byte[] validPaymentAddress = new byte[582];
+    final byte[] validPhoneNumberSharing = new byte[29];
+
+    doThrow(WriteConflictException.class)
+        .when(profilesManager).set(any(), any(), any(), any());
+
+    final SetProfileRequest request = SetProfileRequest.newBuilder()
+        .setVersion(ByteString.copyFrom(VERSION))
+        .setData(ByteString.copyFrom(VALID_DATA))
+        .setCommitment(ByteString.copyFrom(commitment)) // after v1 -> v2 migration, commitment can be null if expectedDataHash is present
+        .setPaymentAddress(ByteString.copyFrom(validPaymentAddress))
+        .setV1Request(V1_REQUEST.toBuilder()
+            .setAvatarChange(AvatarChange.AVATAR_CHANGE_UNCHANGED)
+            .setAboutEmoji(ByteString.copyFrom(validAboutEmoji))
+            .setAbout(ByteString.copyFrom(validAbout))
+            .setPhoneNumberSharing(ByteString.copyFrom(validPhoneNumberSharing))
+        )
+        .build();
+
+    final SetProfileResponse response = authenticatedServiceStub().setProfile(request);
+
+    assertTrue(response.hasExpectedDataWriteConflict());
+    verify(accountsManager, never()).updateCurrentProfileVersion(any(), any(), any(), any());
+  }
+
+  @Test
+  void setProfileExpectedVersionWriteConflictBeforeUpdates() throws Exception {
+    final byte[] commitment = new ProfileKey(new byte[32]).getCommitment(new ServiceId.Aci(AUTHENTICATED_ACI)).serialize();
+    final byte[] validAboutEmoji = new byte[60];
+    final byte[] validAbout = new byte[540];
+    final byte[] validPaymentAddress = new byte[582];
+    final byte[] validPhoneNumberSharing = new byte[29];
+
+    when(account.getCurrentProfileVersion()).thenReturn(
+        Optional.of(TestRandomUtil.nextBytes(32)));
+
+    final SetProfileRequest request = SetProfileRequest.newBuilder()
+        .setVersion(ByteString.copyFrom(VERSION))
+        .setData(ByteString.copyFrom(VALID_DATA))
+        .setCommitment(ByteString.copyFrom(commitment)) // after v1 -> v2 migration, commitment can be null if expectedDataHash is present
+        .setPaymentAddress(ByteString.copyFrom(validPaymentAddress))
+        .setExpectedCurrentVersion(ByteString.copyFrom(VERSION))
+        .setV1Request(V1_REQUEST.toBuilder()
+            .setAvatarChange(AvatarChange.AVATAR_CHANGE_UNCHANGED)
+            .setAboutEmoji(ByteString.copyFrom(validAboutEmoji))
+            .setAbout(ByteString.copyFrom(validAbout))
+            .setPhoneNumberSharing(ByteString.copyFrom(validPhoneNumberSharing))
+        )
+        .build();
+
+    final SetProfileResponse response = authenticatedServiceStub().setProfile(request);
+
+    assertTrue(response.hasExpectedVersionWriteConflict());
+    verify(profilesManager, never()).set(any(), any(), any(), any());
+    verify(accountsManager, never()).updateCurrentProfileVersion(any(), any(), any(), any());
+  }
+
+  @Test
+  void setProfileExpectedVersionWriteConflict() throws Exception {
+    final byte[] commitment = new ProfileKey(new byte[32]).getCommitment(new ServiceId.Aci(AUTHENTICATED_ACI)).serialize();
+    final byte[] validAboutEmoji = new byte[60];
+    final byte[] validAbout = new byte[540];
+    final byte[] validPaymentAddress = new byte[582];
+    final byte[] validPhoneNumberSharing = new byte[29];
+
+    doThrow(WriteConflictException.class)
+        .when(accountsManager).updateCurrentProfileVersion(any(), any(), any(), any());
+
+    final SetProfileRequest request = SetProfileRequest.newBuilder()
+        .setVersion(ByteString.copyFrom(VERSION))
+        .setData(ByteString.copyFrom(VALID_DATA))
+        .setCommitment(ByteString.copyFrom(commitment)) // after v1 -> v2 migration, commitment can be null if expectedDataHash is present
+        .setPaymentAddress(ByteString.copyFrom(validPaymentAddress))
+        .setV1Request(V1_REQUEST.toBuilder()
+            .setAvatarChange(AvatarChange.AVATAR_CHANGE_UNCHANGED)
+            .setAboutEmoji(ByteString.copyFrom(validAboutEmoji))
+            .setAbout(ByteString.copyFrom(validAbout))
+            .setPhoneNumberSharing(ByteString.copyFrom(validPhoneNumberSharing))
+        )
+        .build();
+
+    final SetProfileResponse response = authenticatedServiceStub().setProfile(request);
+
+    assertTrue(response.hasExpectedVersionWriteConflict());
+    verify(profilesManager).set(any(), any(), any(), any());
+    verify(accountsManager).updateCurrentProfileVersion(any(), any(), any(), any());
+  }
+
+  @Test
   void setProfileWithoutCapability() {
     when(account.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(false);
 
@@ -622,7 +715,7 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
         .setVersion(ByteString.copyFrom(requestVersion))
         .build();
 
-    when(account.getCurrentProfileVersion()).thenReturn(Optional.ofNullable(accountVersion).map(v -> HexFormat.of().formatHex(v)));
+    when(account.getCurrentProfileVersion()).thenReturn(Optional.ofNullable(accountVersion));
     when(accountsManager.getByServiceIdentifier(any())).thenReturn(Optional.of(account));
     when(profilesManager.getV1(any(), any())).thenReturn(profile);
 
@@ -640,7 +733,7 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     if (expectResponseHasPaymentAddress) {
       expectedResultBuilder.setPaymentAddressDataEtag(
           DataEtag.newBuilder().setData(ByteString.copyFrom(paymentAddress))
-              .setEtag(ByteString.copyFrom(ProfileGrpcHelper.hash(paymentAddress)))
+              .setEtagSha256(ByteString.copyFrom(ProfileGrpcHelper.hash(paymentAddress)))
               .build());
 
     }
@@ -664,7 +757,6 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     final byte[] paymentAddress = TestRandomUtil.nextBytes(582);
     final byte[] commitment = TestRandomUtil.nextBytes(97);
     final byte[] version = TestRandomUtil.nextBytes(32);
-    final String versionHex = HexFormat.of().formatHex(version);
 
     final UUID targetAci = UUID.randomUUID();
     final VersionedProfile v2Profile = new VersionedProfile(version, data, paymentAddress, commitment);
@@ -673,7 +765,7 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(targetAci)))
         .thenReturn(Optional.of(targetAccount));
     when(targetAccount.getUuid()).thenReturn(targetAci);
-    when(targetAccount.getCurrentProfileVersion()).thenReturn(Optional.of(versionHex));
+    when(targetAccount.getCurrentProfileVersion()).thenReturn(Optional.of(version));
     when(targetAccount.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(true);
 
     when(profilesManager.get(eq(targetAci), aryEq(version))).thenReturn(Optional.of(v2Profile));
@@ -693,10 +785,10 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
 
     assertTrue(result.hasDataEtag());
     assertEquals(ByteString.copyFrom(data), result.getDataEtag().getData());
-    assertEquals(ByteString.copyFrom(v2Profile.dataHash()), result.getDataEtag().getEtag());
+    assertEquals(ByteString.copyFrom(v2Profile.dataHash()), result.getDataEtag().getEtagSha256());
     assertTrue(result.hasPaymentAddressDataEtag());
     assertEquals(ByteString.copyFrom(paymentAddress), result.getPaymentAddressDataEtag().getData());
-    assertEquals(ByteString.copyFrom(v2Profile.paymentAddressHash()), result.getPaymentAddressDataEtag().getEtag());
+    assertEquals(ByteString.copyFrom(v2Profile.paymentAddressHash()), result.getPaymentAddressDataEtag().getEtagSha256());
     assertFalse(result.getDataEtagMatched());
     assertFalse(result.getPaymentAddressEtagMatched());
     assertFalse(result.hasV1Response());
@@ -708,7 +800,6 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     final byte[] paymentAddress = TestRandomUtil.nextBytes(582);
     final byte[] commitment = TestRandomUtil.nextBytes(97);
     final byte[] version = TestRandomUtil.nextBytes(32);
-    final String versionHex = HexFormat.of().formatHex(version);
     final VersionedProfile v2Profile = new VersionedProfile(version, data, paymentAddress, commitment);
 
     final UUID targetAci = UUID.randomUUID();
@@ -717,7 +808,7 @@ public class ProfileGrpcServiceTest extends SimpleBaseGrpcTest<ProfileGrpcServic
     when(targetAccount.hasCapability(DeviceCapability.PROFILES_V2)).thenReturn(true);
     when(accountsManager.getByServiceIdentifier(new AciServiceIdentifier(targetAci))).thenReturn(Optional.of(targetAccount));
 
-    when(targetAccount.getCurrentProfileVersion()).thenReturn(Optional.of(versionHex));
+    when(targetAccount.getCurrentProfileVersion()).thenReturn(Optional.of(version));
     when(profilesManager.get(targetAci, version)).thenReturn(Optional.of(v2Profile));
     when(profilesManager.getV1(any(), any())).thenReturn(Optional.empty());
 

@@ -117,15 +117,19 @@ public final class Operations {
   }
 
   public static String peekVerificationSessionPushChallenge(final String sessionId) {
-    return INTEGRATION_TOOLS.peekVerificationSessionPushChallenge(sessionId).join()
+    return INTEGRATION_TOOLS.peekVerificationSessionPushChallenge(sessionId)
         .orElseThrow(() -> new RuntimeException("push challenge not found for the verification session"));
   }
 
   public static byte[] populateRandomRecoveryPassword(final String number) {
     final byte[] recoveryPassword = randomBytes(32);
-    INTEGRATION_TOOLS.populateRecoveryPassword(number, recoveryPassword).join();
+    INTEGRATION_TOOLS.populateRecoveryPassword(number, recoveryPassword);
 
     return recoveryPassword;
+  }
+
+  public static void clearChangeNumberWaitingPeriod(final TestUser user) {
+    INTEGRATION_TOOLS.clearChangeNumberWaitingPeriod(user);
   }
 
   public static <T> T sendEmptyRequestAuthenticated(

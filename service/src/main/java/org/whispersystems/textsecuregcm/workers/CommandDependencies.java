@@ -52,6 +52,8 @@ import org.whispersystems.textsecuregcm.securevaluerecovery.SecureValueRecoveryC
 import org.whispersystems.textsecuregcm.storage.AccountLockManager;
 import org.whispersystems.textsecuregcm.storage.Accounts;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
+import org.whispersystems.textsecuregcm.storage.ChangeNumberWaitingPeriodManager;
+import org.whispersystems.textsecuregcm.storage.ChangeNumberWaitingPeriods;
 import org.whispersystems.textsecuregcm.storage.DynamicConfigurationManager;
 import org.whispersystems.textsecuregcm.storage.DynamoDbRecoveryManager;
 import org.whispersystems.textsecuregcm.storage.IssuedReceiptsManager;
@@ -206,7 +208,7 @@ public record CommandDependencies(
     RegistrationRecoveryPasswords registrationRecoveryPasswords = new RegistrationRecoveryPasswords(
         configuration.getDynamoDbTables().getRegistrationRecovery().getTableName(),
         configuration.getDynamoDbTables().getRegistrationRecovery().getExpiration(),
-        dynamoDbAsyncClient,
+        dynamoDbClient,
         clock);
 
     Accounts accounts = new Accounts(
@@ -281,9 +283,13 @@ public record CommandDependencies(
         configuration.getDynamoDbTables().getDeletedAccountsLock().getTableName());
     RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager =
         new RegistrationRecoveryPasswordsManager(registrationRecoveryPasswords);
+    final ChangeNumberWaitingPeriods changeNumberWaitingPeriods = new ChangeNumberWaitingPeriods(
+        configuration.getDynamoDbTables().getChangeNumberWaitingPeriods().getTableName(), dynamoDbClient);
+    final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager = new ChangeNumberWaitingPeriodManager(
+        changeNumberWaitingPeriods, configuration.getChangeNumber().postRegistrationWaitingPeriod(), clock);
     AccountsManager accountsManager = new AccountsManager(accounts, phoneNumberIdentifiers, cacheCluster,
         pubsubClient, accountLockManager, keys, messagesManager, profilesManager,
-        secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
+        changeNumberWaitingPeriodManager, secureStorageClient, secureValueRecovery2Client, disconnectionRequestManager,
         registrationRecoveryPasswordsManager, accountLockExecutor, messagePollExecutor,
         retryExecutor, clock, configuration.getLinkDeviceSecretConfiguration().secret().value());
     RateLimiters rateLimiters = RateLimiters.create(dynamicConfigurationManager, rateLimitersCluster, retryExecutor);
@@ -338,12 +344,12 @@ public record CommandDependencies(
         configuration.getAppleAppStore().subscriptionGroupId(),
         configuration.getAppleAppStore().productIdToLevel());
     final SubscriptionManager subscriptionManager = new SubscriptionManager(
-        new Subscriptions(configuration.getDynamoDbTables().getSubscriptions().getTableName(), dynamoDbAsyncClient),
+        new Subscriptions(configuration.getDynamoDbTables().getSubscriptions().getTableName(), dynamoDbClient),
         List.of(googlePlayBillingManager, appleAppStoreManager),
         zkReceiptOperations,
         issuedReceiptsManager);
 
-    APNSender apnSender = new APNSender(apnSenderExecutor, configuration.getApnConfiguration());
+    APNSender apnSender = new APNSender(apnSenderExecutor, Clock.systemUTC(), configuration.getApnConfiguration());
     FcmSender fcmSender = new FcmSender(fcmSenderExecutor, configuration.getFcmConfiguration().credentials().value());
     PushNotificationScheduler pushNotificationScheduler = new PushNotificationScheduler(pushSchedulerCluster,
         apnSender, fcmSender, accountsManager, 0, 0, retryExecutor);

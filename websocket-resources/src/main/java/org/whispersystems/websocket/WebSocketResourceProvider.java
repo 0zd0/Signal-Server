@@ -24,11 +24,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import org.eclipse.jetty.server.Request;
-import org.eclipse.jetty.websocket.api.RemoteEndpoint;
+import java.util.stream.Collectors;
+import org.eclipse.jetty.websocket.api.Callback;
 import org.eclipse.jetty.websocket.api.Session;
-import org.eclipse.jetty.websocket.api.WebSocketListener;
-import org.eclipse.jetty.websocket.api.WriteCallback;
 import org.eclipse.jetty.websocket.api.exceptions.MessageTooLargeException;
 import org.glassfish.jersey.internal.MapPropertiesDelegate;
 import org.glassfish.jersey.server.ApplicationHandler;
@@ -48,11 +46,11 @@ import org.whispersystems.websocket.setup.WebSocketConnectListener;
 
 
 @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
-public class WebSocketResourceProvider<T extends Principal> implements WebSocketListener {
+public class WebSocketResourceProvider<T extends Principal> implements Session.Listener.AutoDemanding {
 
   /**
    * A static exception instance passed to outstanding requests (via {@code completeExceptionally} in
-   * {@link #onWebSocketClose(int, String)}
+   * {@link #onWebSocketClose}
    */
   public static final IOException CONNECTION_CLOSED_EXCEPTION = new IOException("Connection closed!");
   private static final Logger logger = LoggerFactory.getLogger(WebSocketResourceProvider.class);
@@ -70,7 +68,6 @@ public class WebSocketResourceProvider<T extends Principal> implements WebSocket
   private final int localPort;
 
   private Session session;
-  private RemoteEndpoint remoteEndpoint;
   private WebSocketSessionContext context;
 
   private static final Set<String> EXCLUDED_UPGRADE_REQUEST_HEADERS = Set.of("connection", "upgrade");
@@ -96,11 +93,10 @@ public class WebSocketResourceProvider<T extends Principal> implements WebSocket
   }
 
   @Override
-  public void onWebSocketConnect(Session session) {
+  public void onWebSocketOpen(Session session) {
     this.session = session;
-    this.remoteEndpoint = session.getRemote();
     this.context = new WebSocketSessionContext(
-        new WebSocketClient(session, remoteEndpoint, messageFactory, requestMap));
+        new WebSocketClient(session, messageFactory, requestMap));
     this.context.setAuthenticated(reusableAuth.orElse(null));
     this.session.setIdleTimeout(idleTimeout);
 
@@ -125,9 +121,19 @@ public class WebSocketResourceProvider<T extends Principal> implements WebSocket
   }
 
   @Override
-  public void onWebSocketBinary(byte[] payload, int offset, int length) {
+  public void onWebSocketBinary(final ByteBuffer payload, final Callback callback) {
     try {
-      WebSocketMessage webSocketMessage = messageFactory.parseMessage(payload, offset, length);
+      onWebSocketBinary(payload);
+      callback.succeed();
+    } catch (RuntimeException e) {
+      callback.fail(e);
+      throw e;
+    }
+  }
+
+  private void onWebSocketBinary(ByteBuffer payload) {
+    try {
+      final WebSocketMessage webSocketMessage = messageFactory.parseMessage(payload);
 
       switch (webSocketMessage.getType()) {
         case REQUEST_MESSAGE:
@@ -147,17 +153,21 @@ public class WebSocketResourceProvider<T extends Principal> implements WebSocket
   }
 
   @Override
-  public void onWebSocketClose(int statusCode, String reason) {
-    if (context != null) {
-      context.notifyClosed(statusCode, reason);
+  public void onWebSocketClose(int statusCode, String reason, Callback callback) {
+    try {
+      if (context != null) {
+        context.notifyClosed(statusCode, reason);
 
-      for (long requestId : requestMap.keySet()) {
-        CompletableFuture<WebSocketResponseMessage> outstandingRequest = requestMap.remove(requestId);
+        for (long requestId : requestMap.keySet()) {
+          CompletableFuture<WebSocketResponseMessage> outstandingRequest = requestMap.remove(requestId);
 
-        if (outstandingRequest != null) {
-          outstandingRequest.completeExceptionally(CONNECTION_CLOSED_EXCEPTION);
+          if (outstandingRequest != null) {
+            outstandingRequest.completeExceptionally(CONNECTION_CLOSED_EXCEPTION);
+          }
         }
       }
+    } finally {
+      callback.succeed();
     }
   }
 
@@ -191,7 +201,7 @@ public class WebSocketResourceProvider<T extends Principal> implements WebSocket
     ContainerRequest containerRequest = new ContainerRequest(null, URI.create(requestMessage.getPath()),
         requestMessage.getVerb(), new WebSocketSecurityContext(new ContextPrincipal(context)),
         new MapPropertiesDelegate(new HashMap<>()), jerseyHandler.getConfiguration());
-    containerRequest.headers(getCombinedHeaders(session.getUpgradeRequest().getHeaders(), requestMessage.getHeaders()));
+    containerRequest.headers(getCombinedHeaders(toLowerCaseHeaders(session.getUpgradeRequest().getHeaders()), requestMessage.getHeaders()));
 
     final int requestBytes = requestMessage.getBody().map(body -> body.length).orElse(0);
 
@@ -235,17 +245,32 @@ public class WebSocketResourceProvider<T extends Principal> implements WebSocket
         });
   }
 
+  private static Map<String, List<String>> toLowerCaseHeaders(Map<String, List<String>> headers) {
+    return headers.entrySet().stream().collect(Collectors.toMap(
+        entry -> entry.getKey().trim().toLowerCase(),
+        Map.Entry::getValue));
+  }
+
   @VisibleForTesting
-  static Map<String, List<String>> getCombinedHeaders(final Map<String, List<String>> upgradeRequestHeaders, final Map<String, String> requestMessageHeaders) {
+  static Map<String, List<String>> getCombinedHeaders(
+      final Map<String, List<String>> lowerCaseUpgradeRequestHeaders,
+      final Map<String, String> lowerCaseRequestMessageHeaders) {
     final Map<String, List<String>> combinedHeaders = new HashMap<>();
 
-    upgradeRequestHeaders.entrySet().stream()
+    lowerCaseUpgradeRequestHeaders.entrySet().stream()
         .filter(entry -> shouldIncludeUpgradeRequestHeader(entry.getKey()))
         .forEach(entry -> combinedHeaders.put(entry.getKey(), entry.getValue()));
 
-    requestMessageHeaders.entrySet().stream()
+    lowerCaseRequestMessageHeaders.entrySet().stream()
         .filter(entry -> shouldIncludeRequestMessageHeader(entry.getKey()))
         .forEach(entry -> combinedHeaders.put(entry.getKey(), List.of(entry.getValue())));
+
+    // 5/15/26: Typically, request-level headers should overwrite connection level headers, however some clients
+    // errantly supply a User-Agent header on their inner request. Once clients are updated this can be removed.
+    final List<String> userAgentFromUpgradeRequest = lowerCaseUpgradeRequestHeaders.get(HttpHeaders.USER_AGENT.toLowerCase());
+    if (userAgentFromUpgradeRequest != null) {
+      combinedHeaders.put(HttpHeaders.USER_AGENT.toLowerCase(), userAgentFromUpgradeRequest);
+    }
 
     return combinedHeaders;
   }
@@ -269,7 +294,7 @@ public class WebSocketResourceProvider<T extends Principal> implements WebSocket
   }
 
   private void close(Session session, int status, String message) {
-    session.close(status, message);
+    session.close(status, message, Callback.NOOP);
   }
 
   private void sendResponse(WebSocketRequestMessage requestMessage, ContainerResponse response,
@@ -288,7 +313,7 @@ public class WebSocketResourceProvider<T extends Principal> implements WebSocket
               Optional.ofNullable(body))
           .toByteArray();
 
-      remoteEndpoint.sendBytes(ByteBuffer.wrap(responseBytes), WriteCallback.NOOP);
+      session.sendBinary(ByteBuffer.wrap(responseBytes), Callback.NOOP);
     }
   }
 
@@ -300,7 +325,7 @@ public class WebSocketResourceProvider<T extends Principal> implements WebSocket
           getHeaderList(error.getStringHeaders()),
           Optional.empty());
 
-      remoteEndpoint.sendBytes(ByteBuffer.wrap(response.toByteArray()), WriteCallback.NOOP);
+      session.sendBinary(ByteBuffer.wrap(response.toByteArray()), Callback.NOOP);
     }
   }
 

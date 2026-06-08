@@ -37,7 +37,6 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -129,6 +128,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   private final KeysManager keysManager;
   private final MessagesManager messagesManager;
   private final ProfilesManager profilesManager;
+  private final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager;
   private final SecureStorageClient secureStorageClient;
   private final SecureValueRecoveryClient secureValueRecovery2Client;
   private final DisconnectionRequestManager disconnectionRequestManager;
@@ -210,7 +210,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
       final AccountLockManager accountLockManager,
       final KeysManager keysManager,
       final MessagesManager messagesManager,
-      final ProfilesManager profilesManager,
+      final ProfilesManager profilesManager, final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager,
       final SecureStorageClient secureStorageClient,
       final SecureValueRecoveryClient secureValueRecovery2Client,
       final DisconnectionRequestManager disconnectionRequestManager,
@@ -227,6 +227,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     this.keysManager = keysManager;
     this.messagesManager = messagesManager;
     this.profilesManager = profilesManager;
+    this.changeNumberWaitingPeriodManager = changeNumberWaitingPeriodManager;
     this.secureStorageClient = secureStorageClient;
     this.secureValueRecovery2Client = secureValueRecovery2Client;
     this.disconnectionRequestManager = disconnectionRequestManager;
@@ -412,10 +413,10 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
     final boolean rrpCreated = accountAttributes.recoveryPassword().map(registrationRecoveryPassword ->
             registrationRecoveryPasswordsManager
-                .store(account.getIdentifier(IdentityType.PNI), registrationRecoveryPassword)
-                .join())
+                .store(account.getIdentifier(IdentityType.PNI), registrationRecoveryPassword))
         .orElse(false);
 
+    changeNumberWaitingPeriodManager.handleAccountCreated(account.getUuid(), clock.instant());
 
     Tags tags = Tags.of(UserAgentTagUtil.getPlatformTag(userAgent),
         Tag.of("type", accountCreationType),
@@ -964,7 +965,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   ///
   /// @throws WriteConflictException if the expected current version does not match the current version
   public Account updateCurrentProfileVersion(final UUID accountIdentifier, final byte[] newVersion,
-      final String expectedCurrentVersion, final Consumer<Account> updater) throws WriteConflictException {
+      final byte[] expectedCurrentVersion, final Consumer<Account> updater) throws WriteConflictException {
 
     Objects.requireNonNull(expectedCurrentVersion, "expectedCurrentVersion");
 
@@ -972,22 +973,20 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     final Account account = accounts.getByAccountIdentifier(accountIdentifier)
         .orElseThrow(() -> new IllegalArgumentException("Account not found: " + accountIdentifier));
 
-    final String newVersionHex = HexFormat.of().formatHex(newVersion);
-
     return accountLockManager.withLock(Set.of(account.getPhoneNumberIdentifier()), () -> {
       final Account maybeUpdatedAccount = update(accountIdentifier, a -> {
-        if (!a.getCurrentProfileVersion().orElse("").equals(expectedCurrentVersion)) {
+        if (!a.getCurrentProfileVersion().orElse(new byte[0]).equals(expectedCurrentVersion)) {
           return false;
         }
 
-        a.setCurrentProfileVersion(newVersionHex);
+        a.setCurrentProfileVersion(newVersion);
 
         updater.accept(a);
 
         return true;
       });
 
-      if (!maybeUpdatedAccount.getCurrentProfileVersion().map(v -> v.equals(newVersionHex)).orElse(false)) {
+      if (!maybeUpdatedAccount.getCurrentProfileVersion().map(v -> v.equals(newVersion)).orElse(false)) {
         throw new WriteConflictException();
       }
 
@@ -1149,7 +1148,7 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   Pair<Account, Optional<Account>> getAccountsForChangeNumber(final UUID accountIdentifier, final String targetNumber) {
     return new Pair<>(accounts.getByAccountIdentifier(accountIdentifier)
             .orElseThrow(() -> new IllegalArgumentException("Account not found: " + accountIdentifier)),
-        accounts.getByE164(targetNumber));
+        accounts.getByPhoneNumberIdentifier(getPhoneNumberIdentifier(targetNumber)));
   }
 
   public UUID getPhoneNumberIdentifier(String e164) {
@@ -1214,9 +1213,10 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
             keysManager.deleteSingleUsePreKeys(account.getUuid()),
             keysManager.deleteSingleUsePreKeys(account.getPhoneNumberIdentifier()),
             messagesManager.clear(account.getUuid()),
-            profilesManager.deleteAll(account.getUuid(), true),
-            registrationRecoveryPasswordsManager.remove(account.getIdentifier(IdentityType.PNI)))
+            profilesManager.deleteAll(account.getUuid(), true))
         .join();
+
+    registrationRecoveryPasswordsManager.remove(account.getIdentifier(IdentityType.PNI));
 
     accounts.delete(account.getUuid(), additionalWriteItems);
     redisDelete(account);

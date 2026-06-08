@@ -10,7 +10,10 @@ import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 import com.google.common.annotations.VisibleForTesting;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tags;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
@@ -29,6 +32,8 @@ public class PushNotificationManager {
   private final APNSender apnSender;
   private final FcmSender fcmSender;
   private final PushNotificationScheduler pushNotificationScheduler;
+
+  private static final Duration VERIFICATION_CODE_TTL = Duration.ofMinutes(10);
 
   private static final String SENT_NOTIFICATION_COUNTER_NAME = name(PushNotificationManager.class, "sentPushNotification");
   private static final String FAILED_NOTIFICATION_COUNTER_NAME = name(PushNotificationManager.class, "failedPushNotification");
@@ -52,11 +57,12 @@ public class PushNotificationManager {
     final Pair<String, PushNotification.TokenType> tokenAndType = getToken(device);
 
     return sendNotification(new PushNotification(tokenAndType.first(), tokenAndType.second(),
-        PushNotification.NotificationType.NOTIFICATION, null, destination, device, urgent));
+        PushNotification.NotificationType.NOTIFICATION, null, destination, device, urgent, null));
   }
 
   public CompletableFuture<SendPushNotificationResult> sendRegistrationChallengeNotification(final String deviceToken, final PushNotification.TokenType tokenType, final String challengeToken) {
-    return sendNotification(new PushNotification(deviceToken, tokenType, PushNotification.NotificationType.CHALLENGE, challengeToken, null, null, true))
+    return sendNotification(new PushNotification(deviceToken, tokenType, PushNotification.NotificationType.CHALLENGE, challengeToken, null, null, true,
+        null))
         .thenApply(maybeResponse -> maybeResponse.orElseThrow(() -> new AssertionError("Responses must be present for urgent notifications")));
   }
 
@@ -67,7 +73,7 @@ public class PushNotificationManager {
     final Pair<String, PushNotification.TokenType> tokenAndType = getToken(device);
 
     return sendNotification(new PushNotification(tokenAndType.first(), tokenAndType.second(),
-        PushNotification.NotificationType.RATE_LIMIT_CHALLENGE, challengeToken, destination, device, true))
+        PushNotification.NotificationType.RATE_LIMIT_CHALLENGE, challengeToken, destination, device, true, null))
         .thenApply(maybeResponse -> maybeResponse.orElseThrow(() -> new AssertionError("Responses must be present for urgent notifications")));
   }
 
@@ -77,8 +83,25 @@ public class PushNotificationManager {
 
     return sendNotification(new PushNotification(tokenAndType.first(), tokenAndType.second(),
         PushNotification.NotificationType.ATTEMPT_LOGIN_NOTIFICATION_HIGH_PRIORITY,
-        context, destination, device, true))
+        context, destination, device, true, null))
         .thenApply(maybeResponse -> maybeResponse.orElseThrow(() -> new AssertionError("Responses must be present for urgent notifications")));
+  }
+
+  public CompletableFuture<SendPushNotificationResult> sendVerificationCodeRequestedNotifications(final Account destination, final Instant requestTimestamp)
+      throws NotPushRegisteredException {
+
+    final Pair<String, PushNotification.TokenType> tokenAndType = getToken(destination.getPrimaryDevice());
+
+    return sendNotification(new PushNotification(tokenAndType.first(),
+        tokenAndType.second(),
+        PushNotification.NotificationType.VERIFICATION_CODE_REQUESTED,
+        new VerificationCodeRequestData(requestTimestamp.toEpochMilli()),
+        destination,
+        destination.getPrimaryDevice(),
+        true,
+        VERIFICATION_CODE_TTL))
+        .thenApply(maybeResponse -> maybeResponse.orElseThrow(
+            () -> new AssertionError("Responses must be present for urgent notifications")));
   }
 
   public void handleMessagesRetrieved(final Account account, final Device device, final String userAgent) {

@@ -7,6 +7,7 @@ package org.whispersystems.textsecuregcm.controllers;
 
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.i18n.phonenumbers.NumberParseException;
 import com.google.i18n.phonenumbers.PhoneNumberUtil;
 import com.google.i18n.phonenumbers.Phonenumber;
@@ -60,7 +61,6 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
-import java.util.concurrent.TimeUnit;
 import org.apache.commons.lang3.Strings;
 import org.apache.http.HttpStatus;
 import org.slf4j.Logger;
@@ -74,12 +74,15 @@ import org.whispersystems.textsecuregcm.entities.SubmitVerificationCodeRequest;
 import org.whispersystems.textsecuregcm.entities.UpdateVerificationSessionRequest;
 import org.whispersystems.textsecuregcm.entities.VerificationCodeRequest;
 import org.whispersystems.textsecuregcm.entities.VerificationSessionResponse;
+import org.whispersystems.textsecuregcm.experiment.ExperimentEnrollmentManager;
 import org.whispersystems.textsecuregcm.filters.RemoteAddressFilter;
+import org.whispersystems.textsecuregcm.identity.IdentityType;
 import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.mappers.RegistrationServiceSenderExceptionMapper;
 import org.whispersystems.textsecuregcm.metrics.CaptchaMetrics;
 import org.whispersystems.textsecuregcm.metrics.DevicePlatformUtil;
 import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
+import org.whispersystems.textsecuregcm.push.NotPushRegisteredException;
 import org.whispersystems.textsecuregcm.push.PushNotification;
 import org.whispersystems.textsecuregcm.push.PushNotificationManager;
 import org.whispersystems.textsecuregcm.registration.ClientType;
@@ -113,7 +116,6 @@ public class VerificationController {
 
   private static final Logger logger = LoggerFactory.getLogger(VerificationController.class);
   private static final Duration REGISTRATION_RPC_TIMEOUT = Duration.ofSeconds(15);
-  private static final Duration DYNAMODB_TIMEOUT = Duration.ofSeconds(5);
 
   private static final SecureRandom RANDOM = new SecureRandom();
 
@@ -133,6 +135,9 @@ public class VerificationController {
   private static final String EXISTING_ACCOUNT_PLATFORM = "existingAccountPlatform";
   private static final String EXISTING_ACCOUNT_RECENTLY_SEEN_TAG_NAME = "existingAccountRecentlySeen";
 
+  @VisibleForTesting
+  static final String VERIFICATION_CODE_PUSH_NOTIFICATION_EXPERIMENT_NAME = "verificationCodePushNotification";
+
   private final RegistrationServiceClient registrationServiceClient;
   private final VerificationSessionManager verificationSessionManager;
   private final PushNotificationManager pushNotificationManager;
@@ -144,6 +149,7 @@ public class VerificationController {
   private final CarrierDataProvider carrierDataProvider;
   private final RegistrationFraudChecker registrationFraudChecker;
   private final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager;
+  private final ExperimentEnrollmentManager experimentEnrollmentManager;
   private final Clock clock;
 
   public VerificationController(final RegistrationServiceClient registrationServiceClient,
@@ -157,6 +163,7 @@ public class VerificationController {
       final CarrierDataProvider carrierDataProvider,
       final RegistrationFraudChecker registrationFraudChecker,
       final DynamicConfigurationManager<DynamicConfiguration> dynamicConfigurationManager,
+      final ExperimentEnrollmentManager experimentEnrollmentManager,
       final Clock clock) {
     this.registrationServiceClient = registrationServiceClient;
     this.verificationSessionManager = verificationSessionManager;
@@ -169,6 +176,7 @@ public class VerificationController {
     this.carrierDataProvider = carrierDataProvider;
     this.registrationFraudChecker = registrationFraudChecker;
     this.dynamicConfigurationManager = dynamicConfigurationManager;
+    this.experimentEnrollmentManager = experimentEnrollmentManager;
     this.clock = clock;
   }
 
@@ -255,7 +263,7 @@ public class VerificationController {
     // if a push challenge sent in `handlePushToken` doesn't arrive in time
     verificationSession.requestedInformation().add(VerificationSession.Information.CAPTCHA);
 
-    storeVerificationSession(verificationSession);
+    verificationSessionManager.insert(verificationSession);
 
     return buildResponse(registrationServiceSession, verificationSession);
   }
@@ -328,22 +336,10 @@ public class VerificationController {
     } finally {
       // Each of the handle* methods may update requestedInformation, submittedInformation, and allowedToRequestCode,
       // and we want to be sure to store a changes, even if a later method throws
-      updateStoredVerificationSession(verificationSession);
+      verificationSessionManager.update(verificationSession);
     }
 
     return buildResponse(registrationServiceSession, verificationSession);
-  }
-
-  private void storeVerificationSession(final VerificationSession verificationSession) {
-    verificationSessionManager.insert(verificationSession)
-        .orTimeout(DYNAMODB_TIMEOUT.toSeconds(), TimeUnit.SECONDS)
-        .join();
-  }
-
-  private void updateStoredVerificationSession(final VerificationSession verificationSession) {
-    verificationSessionManager.update(verificationSession)
-        .orTimeout(DYNAMODB_TIMEOUT.toSeconds(), TimeUnit.SECONDS)
-        .join();
   }
 
   /**
@@ -656,6 +652,16 @@ public class VerificationController {
           acceptLanguage.orElse(null),
           senderOverride,
           REGISTRATION_RPC_TIMEOUT).join();
+
+      accountsManager.getByE164(registrationServiceSession.number())
+          .filter(existingAccount ->
+              experimentEnrollmentManager.isEnrolled(existingAccount.getIdentifier(IdentityType.ACI), VERIFICATION_CODE_PUSH_NOTIFICATION_EXPERIMENT_NAME))
+          .ifPresent(existingAccount -> {
+            try {
+              pushNotificationManager.sendVerificationCodeRequestedNotifications(existingAccount, clock.instant());
+            } catch (final NotPushRegisteredException _) {
+            }
+          });
     } catch (final CancellationException e) {
       throw new ServerErrorException("registration service unavailable", Response.Status.SERVICE_UNAVAILABLE);
     } catch (final CompletionException e) {
@@ -792,7 +798,7 @@ public class VerificationController {
       // the RRP. It's possible the client will not actually be able to register (e.g. failed reglock challenge), and
       // so we will have removed the RRP unnecessarily. The impact of this is low, since the owner of the RRP
       // can always just fallback to session-based verification.
-      existingRRP = registrationRecoveryPasswordsManager.remove(phoneNumberIdentifiers.getPhoneNumberIdentifier(registrationServiceSession.number()).join()).join();
+      existingRRP = registrationRecoveryPasswordsManager.remove(phoneNumberIdentifiers.getPhoneNumberIdentifier(registrationServiceSession.number()).join());
     }
 
     Optional<Account> maybeExistingAccount;
@@ -868,7 +874,7 @@ public class VerificationController {
         // the RRP. It's possible the client will not actually be able to register (e.g. failed reglock challenge), and
         // so we will have removed the RRP unnecessarily. The impact of this is low, since the owner of the RRP
         // can always just fallback to session-based verification.
-        registrationRecoveryPasswordsManager.remove(phoneNumberIdentifiers.getPhoneNumberIdentifier(registrationServiceSession.number()).join()).join();
+        registrationRecoveryPasswordsManager.remove(phoneNumberIdentifiers.getPhoneNumberIdentifier(registrationServiceSession.number()).join());
       }
 
       return registrationServiceSession;
@@ -892,8 +898,7 @@ public class VerificationController {
   private VerificationSession retrieveVerificationSession(final RegistrationServiceSession registrationServiceSession) {
 
     return verificationSessionManager.findForId(registrationServiceSession.encodedSessionId())
-        .orTimeout(5, TimeUnit.SECONDS)
-        .join().orElseThrow(NotFoundException::new);
+        .orElseThrow(NotFoundException::new);
   }
 
   /**

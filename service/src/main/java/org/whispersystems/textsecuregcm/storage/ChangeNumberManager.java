@@ -4,23 +4,28 @@
  */
 package org.whispersystems.textsecuregcm.storage;
 
-import java.time.Clock;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
-import java.util.stream.Collectors;
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
+
 import com.google.common.net.HttpHeaders;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
 import jakarta.ws.rs.container.ContainerRequestContext;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import org.signal.libsignal.protocol.IdentityKey;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.auth.PhoneVerificationTokenManager;
 import org.whispersystems.textsecuregcm.auth.RegistrationLockVerificationManager;
 import org.whispersystems.textsecuregcm.controllers.AccountControllerV2;
+import org.whispersystems.textsecuregcm.controllers.MessageDeliveryNotAllowedException;
 import org.whispersystems.textsecuregcm.controllers.MismatchedDevicesException;
 import org.whispersystems.textsecuregcm.controllers.RateLimitExceededException;
 import org.whispersystems.textsecuregcm.entities.ECSignedPreKey;
@@ -35,9 +40,6 @@ import org.whispersystems.textsecuregcm.metrics.UserAgentTagUtil;
 import org.whispersystems.textsecuregcm.push.MessageSender;
 import org.whispersystems.textsecuregcm.push.MessageTooLargeException;
 import org.whispersystems.textsecuregcm.util.Pair;
-import javax.annotation.Nullable;
-
-import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 public class ChangeNumberManager {
 
@@ -45,6 +47,7 @@ public class ChangeNumberManager {
   private final AccountsManager accountsManager;
   private final PhoneVerificationTokenManager phoneVerificationTokenManager;
   private final RegistrationLockVerificationManager registrationLockVerificationManager;
+  private final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager;
   private final RateLimiters rateLimiters;
   private final Clock clock;
 
@@ -53,6 +56,8 @@ public class ChangeNumberManager {
   // Note that this counter name references another class deliberately in the interest of metric continuity
   private static final String CHANGE_NUMBER_COUNTER_NAME = name(AccountControllerV2.class, "changeNumber");
   private static final String VERIFICATION_TYPE_TAG_NAME = "verification";
+  private static final String POST_REGISTRATION_WAITING_PERIOD_NOT_MET_COUNTER_NAME = name(ChangeNumberManager.class,
+      "postRegistrationWaitingPeriodNotMet");
 
   public ChangeNumberManager(
       final MessageSender messageSender,
@@ -60,6 +65,7 @@ public class ChangeNumberManager {
       final PhoneVerificationTokenManager phoneVerificationTokenManager,
       final RegistrationLockVerificationManager registrationLockVerificationManager,
       final RateLimiters rateLimiters,
+      final ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager,
       final Clock clock) {
 
     this.messageSender = messageSender;
@@ -67,6 +73,7 @@ public class ChangeNumberManager {
     this.phoneVerificationTokenManager = phoneVerificationTokenManager;
     this.registrationLockVerificationManager = registrationLockVerificationManager;
     this.rateLimiters = rateLimiters;
+    this.changeNumberWaitingPeriodManager = changeNumberWaitingPeriodManager;
     this.clock = clock;
   }
 
@@ -81,7 +88,7 @@ public class ChangeNumberManager {
       final List<IncomingMessage> deviceMessages,
       final Map<Byte, Integer> pniRegistrationIds,
       final ContainerRequestContext containerRequestContext)
-      throws InterruptedException, MismatchedDevicesException, MessageTooLargeException, RateLimitExceededException {
+      throws InterruptedException, MismatchedDevicesException, MessageTooLargeException, RateLimitExceededException, MessageDeliveryNotAllowedException {
 
     final String senderUserAgent = containerRequestContext.getHeaderString(HttpHeaders.USER_AGENT);
 
@@ -92,6 +99,13 @@ public class ChangeNumberManager {
 
     // Only verify and check reglock if there's a data change to be made...
     if (!account.getNumber().equals(number)) {
+
+      final Optional<Duration> waitingPeriodRemaining = changeNumberWaitingPeriodManager.getWaitingPeriodRemaining(account.getUuid());
+      if (waitingPeriodRemaining.isPresent()) {
+        Metrics.counter(POST_REGISTRATION_WAITING_PERIOD_NOT_MET_COUNTER_NAME).increment();
+        throw new RateLimitExceededException(waitingPeriodRemaining.get());
+      }
+
       rateLimiters.getRegistrationLimiter().validate(number);
 
       final PhoneVerificationRequest.VerificationType verificationType =

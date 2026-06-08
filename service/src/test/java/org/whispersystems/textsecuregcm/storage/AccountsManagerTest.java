@@ -49,7 +49,6 @@ import java.util.Base64;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -119,10 +118,12 @@ class AccountsManagerTest {
   private static TestClock CLOCK;
 
   private Accounts accounts;
+  private PhoneNumberIdentifiers phoneNumberIdentifiers;
   private KeysManager keysManager;
   private MessagesManager messagesManager;
   private ProfilesManager profilesManager;
   private DisconnectionRequestManager disconnectionRequestManager;
+  private ChangeNumberWaitingPeriodManager changeNumberWaitingPeriodManager;
 
   private Map<String, UUID> phoneNumberIdentifiersByE164;
 
@@ -147,6 +148,7 @@ class AccountsManagerTest {
     messagesManager = mock(MessagesManager.class);
     profilesManager = mock(ProfilesManager.class);
     disconnectionRequestManager = mock(DisconnectionRequestManager.class);
+    changeNumberWaitingPeriodManager = mock(ChangeNumberWaitingPeriodManager.class);
 
     //noinspection unchecked
     asyncCommands = mock(RedisAsyncCommands.class);
@@ -178,12 +180,12 @@ class AccountsManagerTest {
     svr2Client = mock(SecureValueRecoveryClient.class);
     when(svr2Client.removeData(any(UUID.class))).thenReturn(CompletableFuture.completedFuture(null));
 
-    final PhoneNumberIdentifiers phoneNumberIdentifiers = mock(PhoneNumberIdentifiers.class);
+    phoneNumberIdentifiers = mock(PhoneNumberIdentifiers.class);
     phoneNumberIdentifiersByE164 = new HashMap<>();
 
     when(phoneNumberIdentifiers.getPhoneNumberIdentifier(anyString())).thenAnswer((Answer<CompletableFuture<UUID>>) invocation -> {
       final String number = invocation.getArgument(0, String.class);
-      return CompletableFuture.completedFuture(phoneNumberIdentifiersByE164.computeIfAbsent(number, n -> UUID.randomUUID()));
+      return CompletableFuture.completedFuture(phoneNumberIdentifiersByE164.computeIfAbsent(number, _ -> UUID.randomUUID()));
     });
 
     final AccountLockManager accountLockManager = mock(AccountLockManager.class);
@@ -195,8 +197,6 @@ class AccountsManagerTest {
 
     final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager =
         mock(RegistrationRecoveryPasswordsManager.class);
-
-    when(registrationRecoveryPasswordsManager.remove(any())).thenReturn(CompletableFuture.completedFuture(null));
 
     when(keysManager.deleteSingleUsePreKeys(any())).thenReturn(CompletableFuture.completedFuture(null));
     when(messagesManager.clear(any())).thenReturn(CompletableFuture.completedFuture(null));
@@ -224,6 +224,7 @@ class AccountsManagerTest {
         keysManager,
         messagesManager,
         profilesManager,
+        changeNumberWaitingPeriodManager,
         storageClient,
         svr2Client,
         disconnectionRequestManager,
@@ -721,6 +722,8 @@ class AccountsManagerTest {
         notNull(),
         notNull());
 
+    verify(changeNumberWaitingPeriodManager).handleAccountCreated(eq(createdAccount.getUuid()), any(Instant.class));
+
     verifyNoInteractions(messagesManager);
     verifyNoInteractions(profilesManager);
   }
@@ -778,6 +781,7 @@ class AccountsManagerTest {
     verify(profilesManager, times(2)).deleteAll(existingUuid, false);
     verify(disconnectionRequestManager).requestDisconnection(argThat(account ->
         account.getIdentifier(IdentityType.ACI).equals(existingUuid) && account != reregisteredAccount));
+    verify(changeNumberWaitingPeriodManager).handleAccountCreated(eq(existingUuid), any(Instant.class));
   }
 
   @Test
@@ -1456,24 +1460,43 @@ class AccountsManagerTest {
     final UUID accountIdentifier = account.getIdentifier(IdentityType.ACI);
     addRetrievableAccount(account);
 
-    account.setCurrentProfileVersion(HexFormat.of().formatHex(currentVersion));
+    account.setCurrentProfileVersion(currentVersion);
 
     final AccountBadge badge = new AccountBadge("test", CLOCK.instant().plusSeconds(60), true);
 
     assertTrue(account.getBadges().isEmpty());
 
     if (expectException) {
-      assertThrows(WriteConflictException.class, () -> accountsManager.updateCurrentProfileVersion(accountIdentifier, newVersion, HexFormat.of().formatHex(expectedVersion), _ -> {}));
+      assertThrows(WriteConflictException.class, () -> accountsManager.updateCurrentProfileVersion(accountIdentifier, newVersion, expectedVersion, _ -> {}));
     } else {
       final Account updatedAccount = accountsManager.updateCurrentProfileVersion(accountIdentifier, newVersion,
-          HexFormat.of().formatHex(expectedVersion), a -> {
+          expectedVersion, a -> {
 
               a.setBadges(CLOCK, new ArrayList<>(List.of(badge)));
           });
 
-      assertArrayEquals(newVersion, HexFormat.of().parseHex(updatedAccount.getCurrentProfileVersion().orElseThrow()));
+      assertArrayEquals(newVersion, updatedAccount.getCurrentProfileVersion().orElseThrow());
       assertEquals(List.of(badge), updatedAccount.getBadges());
     }
+  }
+
+  @Test
+  void getAccountsForChangeNumber() {
+    final Account account = AccountsHelper.generateTestAccount("+14152222222", UUID.randomUUID(), UUID.randomUUID(), new ArrayList<>(), new byte[UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH]);
+    final UUID accountIdentifier = account.getIdentifier(IdentityType.ACI);
+    addRetrievableAccount(account);
+
+    final String targetNumber = "+13102222222";
+
+    assertFalse(phoneNumberIdentifiersByE164.containsKey(targetNumber));
+
+    final Pair<Account, Optional<Account>> accountsForChangeNumber = accountsManager.getAccountsForChangeNumber(
+        accountIdentifier, targetNumber);
+
+    assertEquals(account, accountsForChangeNumber.first());
+    verify(accounts).getByAccountIdentifier(accountIdentifier);
+    // getPhoneNumberIdentifier handles alternate forms
+    verify(phoneNumberIdentifiers).getPhoneNumberIdentifier(targetNumber);
   }
 
   static Collection<Arguments> updateCurrentProfileVersion() {

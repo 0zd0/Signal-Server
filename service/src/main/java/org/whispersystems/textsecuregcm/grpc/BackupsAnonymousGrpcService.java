@@ -62,11 +62,13 @@ public class BackupsAnonymousGrpcService extends SimpleBackupsAnonymousGrpc.Back
   private final BackupManager backupManager;
   private final BackupMetrics backupMetrics;
   private final long maxAttachmentSize;
+  private final long maxMessageBackupSize;
 
-  public BackupsAnonymousGrpcService(final BackupManager backupManager, final BackupMetrics backupMetrics, final long maxAttachmentSize) {
+  public BackupsAnonymousGrpcService(final BackupManager backupManager, final BackupMetrics backupMetrics, final long maxAttachmentSize, final long maxMessageBackupSize) {
     this.backupManager = backupManager;
     this.backupMetrics = backupMetrics;
     this.maxAttachmentSize = maxAttachmentSize;
+    this.maxMessageBackupSize = maxMessageBackupSize;
   }
 
   @Override
@@ -157,16 +159,19 @@ public class BackupsAnonymousGrpcService extends SimpleBackupsAnonymousGrpc.Back
   }
 
   @Override
-  public SetPublicKeyResponse setPublicKey(final SetPublicKeyRequest request)
-      throws BackupFailedZkAuthenticationException {
+  public SetPublicKeyResponse setPublicKey(final SetPublicKeyRequest request) {
     final ECPublicKey publicKey = deserialize(ECPublicKey::new, request.getPublicKey().toByteArray());
     final BackupAuthCredentialPresentation presentation = deserialize(
         BackupAuthCredentialPresentation::new,
         request.getSignedPresentation().getPresentation().toByteArray());
     final byte[] signature = request.getSignedPresentation().getPresentationSignature().toByteArray();
 
-    backupManager.setPublicKey(presentation, signature, publicKey);
-    return SetPublicKeyResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build();
+    try {
+      backupManager.setPublicKey(presentation, signature, publicKey);
+      return SetPublicKeyResponse.newBuilder().setSuccess(Empty.getDefaultInstance()).build();
+    } catch (BackupFailedZkAuthenticationException e) {
+      return SetPublicKeyResponse.newBuilder().setFailedAuthentication(FailedZkAuthentication.getDefaultInstance()).build();
+    }
   }
 
 
@@ -182,18 +187,21 @@ public class BackupsAnonymousGrpcService extends SimpleBackupsAnonymousGrpc.Back
           .build();
     }
     final long uploadLength = request.getUploadLength();
-    if (uploadLength > maxAttachmentSize) {
-      if (request.getUploadTypeCase() == GetUploadFormRequest.UploadTypeCase.MESSAGES) {
-        backupMetrics.updateMessageBackupSizeDistribution(backupUser, true, Optional.of(uploadLength));
+    final boolean oversize = switch (request.getUploadTypeCase()) {
+      case MEDIA -> uploadLength > maxAttachmentSize;
+      case MESSAGES -> {
+        backupMetrics.updateMessageBackupSizeDistribution(backupUser, uploadLength > maxMessageBackupSize, Optional.of(uploadLength));
+        yield uploadLength > maxMessageBackupSize;
       }
+      case UPLOADTYPE_NOT_SET -> throw GrpcExceptions.fieldViolation("upload_type", "Must set upload_type");
+    };
+
+    if (oversize) {
       return GetUploadFormResponse.newBuilder().setExceedsMaxUploadLength(FailedPrecondition.getDefaultInstance()).build();
     }
 
     final BackupUploadDescriptor uploadDescriptor = switch (request.getUploadTypeCase()) {
-      case MESSAGES -> {
-        backupMetrics.updateMessageBackupSizeDistribution(backupUser, false, Optional.of(uploadLength));
-        yield backupManager.createMessageBackupUploadDescriptor(backupUser, uploadLength);
-      }
+      case MESSAGES -> backupManager.createMessageBackupUploadDescriptor(backupUser, uploadLength);
       case MEDIA -> backupManager.createTemporaryAttachmentUploadDescriptor(backupUser, uploadLength);
       case UPLOADTYPE_NOT_SET -> throw GrpcExceptions.fieldViolation("upload_type", "Must set upload_type");
     };

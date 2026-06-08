@@ -143,6 +143,7 @@ class AccountsManagerUsernameIntegrationTest {
         keysManager,
         messageManager,
         profileManager,
+        mock(ChangeNumberWaitingPeriodManager.class),
         mock(SecureStorageClient.class),
         mock(SecureValueRecoveryClient.class),
         disconnectionRequestManager,
@@ -150,7 +151,7 @@ class AccountsManagerUsernameIntegrationTest {
         Executors.newSingleThreadExecutor(),
         Executors.newSingleThreadScheduledExecutor(),
         Executors.newSingleThreadScheduledExecutor(),
-        mock(Clock.class),
+        Clock.systemUTC(),
         "link-device-secret".getBytes(StandardCharsets.UTF_8));
   }
 

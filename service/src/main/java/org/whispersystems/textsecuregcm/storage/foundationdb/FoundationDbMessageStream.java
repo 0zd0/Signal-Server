@@ -3,14 +3,31 @@ package org.whispersystems.textsecuregcm.storage.foundationdb;
 import com.apple.foundationdb.Database;
 import com.apple.foundationdb.KeySelector;
 import com.apple.foundationdb.StreamingMode;
+import com.apple.foundationdb.Transaction;
 import com.apple.foundationdb.subspace.Subspace;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Optional;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Flow;
+import java.util.function.Consumer;
 
+import com.apple.foundationdb.tuple.ByteArrayUtil;
+import com.apple.foundationdb.tuple.Tuple;
+import com.apple.foundationdb.tuple.Versionstamp;
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.storage.MessageStream;
 import org.whispersystems.textsecuregcm.storage.MessageStreamEntry;
+import org.whispersystems.textsecuregcm.util.Pair;
+import org.whispersystems.textsecuregcm.util.UUIDUtil;
 import reactor.adapter.JdkFlowAdapter;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -24,22 +41,41 @@ public class FoundationDbMessageStream implements MessageStream {
   private final MessageGuidCodec messageGuidCodec;
   /// The maximum number of messages we will fetch per range query operation to avoid excessive memory consumption
   private final int maxMessagesPerScan;
+  /// The maximum number of unacknowledged messages we will send before closing the stream with an error
+  private final int maxUnacknowledgedMessages;
   private final Flow.Publisher<MessageStreamEntry> messageStreamPublisher;
+  private final Runnable doAfterCleanup;
+  private final Clock clock;
 
+  /// Map of versionstamp -> acknowledged? to keep track of acknowledged versionstamp ranges to clear
+  private final NavigableMap<Versionstamp, Boolean> sentVersionstamps = new TreeMap<>();
+  private int unacknowledgedMessages = 0;
+
+  @VisibleForTesting
+  static final Duration MAX_EPHEMERAL_MESSAGE_DELAY = Duration.ofSeconds(10);
   static final int DEFAULT_MAX_MESSAGES_PER_SCAN = 1024;
+  @VisibleForTesting
+  static final int DEFAULT_MAX_UNACKNOWLEDGED_MESSAGES = 16_384;
+
+  private static final Logger LOGGER = LoggerFactory.getLogger(FoundationDbMessageStream.class);
 
   FoundationDbMessageStream(final Subspace deviceQueueSubspace,
       final byte[] messagesAvailableWatchKey,
       final Database database,
       final MessageGuidCodec messageGuidCodec,
-      final int maxMessagesPerScan) {
-
+      final int maxMessagesPerScan,
+      final int maxUnacknowledgedMessages,
+      final Runnable doAfterCleanup,
+      final Clock clock) {
     this.deviceQueueSubspace = deviceQueueSubspace;
     this.messagesAvailableWatchKey = messagesAvailableWatchKey;
     this.database = database;
     this.messageGuidCodec = messageGuidCodec;
     this.maxMessagesPerScan = maxMessagesPerScan;
+    this.maxUnacknowledgedMessages = maxUnacknowledgedMessages;
+    this.clock = clock;
     this.messageStreamPublisher = JdkFlowAdapter.publisherToFlowPublisher(createMessagePublisher());
+    this.doAfterCleanup = doAfterCleanup;
   }
 
   @Override
@@ -47,44 +83,76 @@ public class FoundationDbMessageStream implements MessageStream {
     return this.messageStreamPublisher;
   }
 
-    /// Create a message publisher
-    ///
-    /// @return a Flux of {@link MessageStreamEntry} fetched from FoundationDB
-    /// @implNote The message publisher is stitched together by concatenating:
-    /// 1. **A finite message publisher**: On initial request, we record the current end-of-queue key in the device mailbox.
-    ///    Then, we fetch all messages in order until the recorded key and finally complete the stream
-    /// 2. **A queue-empty signal** is emitted
-    /// 3. **An infinite message publisher**: We start reading from where the finite publisher left off. When all messages
-    ///    are read, we wait for new messages, publish them, then wait again in a loop forever (until the flux is canceled
-    ///    explicitly or due to an error). This is accomplished by setting a FoundationDB [watch](https://github.com/apple/foundationdb/wiki/An-Overview-how-Watches-Work)
-    ///    on [#messagesAvailableWatchKey] which is updated when a new message is available.
-    ///    See [FoundationDbMessageStore] for more details on the message insert process.
-    private Flux<MessageStreamEntry> createMessagePublisher() {
-      return Mono.fromFuture(this::getEndOfQueueKeyExclusive)
+  /// Create a message publisher
+  ///
+  /// @return a Flux of {@link MessageStreamEntry} fetched from FoundationDB
+  /// @implNote turns the stream of [FoundationDbMessageStreamEntry] into [MessageStreamEntry], but taps into the stream
+  /// first to keep track of versionstamps sent to the client.
+  private Flux<MessageStreamEntry> createMessagePublisher() {
+    final long earliestAllowedEphemeralTimestamp = clock.instant().minus(MAX_EPHEMERAL_MESSAGE_DELAY).toEpochMilli();
+    return createFoundationDbMessagePublisher()
+        .<FoundationDbMessageStreamEntry>handle((messageStreamEntry, sink) -> {
+          if (messageStreamEntry instanceof final FoundationDbMessageStreamEntry.Message message) {
+            final int numUnacknowledgedMessages = onVersionstampSent(message.versionstamp());
+            if (numUnacknowledgedMessages > maxUnacknowledgedMessages) {
+              sink.error(new TooManyUnacknowledgedMessagesException());
+              return;
+            }
+          }
+          sink.next(messageStreamEntry);
+        })
+        .map(fdbMessageStreamEntry -> fdbMessageStreamEntry.toMessageStreamEntry(messageGuidCodec))
+        .<MessageStreamEntry>handle((messageStreamEntry, sink) -> {
+          if (messageStreamEntry instanceof MessageStreamEntry.Envelope(MessageProtos.Envelope message)
+              && isStaleEphemeralMessage(message, earliestAllowedEphemeralTimestamp)) {
+            acknowledgeMessage(message);
+            return;
+          }
+          sink.next(messageStreamEntry);
+        })
+        .doFinally(_ -> flushAllAcknowledgedMessages().thenRun(doAfterCleanup));
+  }
+
+  /// Create a message publisher that fetches messages from FoundationDB
+  ///
+  /// @return a Flux of [FoundationDbMessageStreamEntry] fetched from FoundationDB
+  /// @implNote The message publisher is stitched together by concatenating:
+  /// 1. **A finite message publisher**: On initial request, we record the current end-of-queue key in the device mailbox.
+  ///    Then, we fetch all messages in order until the recorded key and finally complete the stream
+  /// 2. **A queue-empty signal** is emitted
+  /// 3. **An infinite message publisher**: We start reading from where the finite publisher left off. When all messages
+  ///    are read, we wait for new messages, publish them, then wait again in a loop forever (until the flux is canceled
+  ///    explicitly or due to an error). This is accomplished by setting a FoundationDB [watch](https://github.com/apple/foundationdb/wiki/An-Overview-how-Watches-Work)
+  ///    on [#messagesAvailableWatchKey] which is updated when a new message is available.
+  ///    See [FoundationDbMessageStore] for more details on the message insert process.
+  private Flux<FoundationDbMessageStreamEntry> createFoundationDbMessagePublisher() {
+    return Mono.fromFuture(this::getEndOfQueueKeyExclusive)
         .flatMapMany(maybeEndOfQueueKeyExclusive -> {
-          final Flux<MessageStreamEntry.Envelope> finitePublisher = maybeEndOfQueueKeyExclusive
+          final Flux<FoundationDbMessageStreamEntry.Message> finitePublisher = maybeEndOfQueueKeyExclusive
               .map(endOfQueueKeyExclusive -> FoundationDbMessagePublisher.createFinitePublisher(
                   KeySelector.firstGreaterOrEqual(deviceQueueSubspace.range().begin),
-                  endOfQueueKeyExclusive, database, messageGuidCodec, maxMessagesPerScan).getMessages())
+                  endOfQueueKeyExclusive, database, maxMessagesPerScan, this::clearAcknowledgedMessages).getMessages())
               .orElseGet(Flux::empty);
           final KeySelector infinitePublisherBeginKey = maybeEndOfQueueKeyExclusive.orElseGet(
               () -> KeySelector.firstGreaterOrEqual(deviceQueueSubspace.range().begin));
-          final Flux<MessageStreamEntry.Envelope> infinitePublisher = FoundationDbMessagePublisher.createInfinitePublisher(
+          final Flux<FoundationDbMessageStreamEntry.Message> infinitePublisher = FoundationDbMessagePublisher.createInfinitePublisher(
               infinitePublisherBeginKey, KeySelector.firstGreaterThan(deviceQueueSubspace.range().end),
-              database, messageGuidCodec, maxMessagesPerScan, messagesAvailableWatchKey).getMessages();
+              database, maxMessagesPerScan, messagesAvailableWatchKey, this::clearAcknowledgedMessages).getMessages();
           return Flux.concat(
               finitePublisher,
-              Mono.just(new MessageStreamEntry.QueueEmpty()),
+              Mono.just(new FoundationDbMessageStreamEntry.QueueEmpty()),
               infinitePublisher
           );
         });
+
   }
 
-    /// Gets a [KeySelector] for the first key greater than the current greatest key in the device queue. This allows
-    /// us to query keys up to and including the greatest key, and sets us up to begin reading from the next key in
-    /// a subsequent scan.
-    /// @return a [KeySelector] for the first key greater than the current greatest key in the device queue.
-    private CompletableFuture<Optional<KeySelector>> getEndOfQueueKeyExclusive() {
+  /// Gets a [KeySelector] for the first key greater than the current greatest key in the device queue. This allows us
+  /// to query keys up to and including the greatest key, and sets us up to begin reading from the next key in a
+  /// subsequent scan.
+  ///
+  /// @return a [KeySelector] for the first key greater than the current greatest key in the device queue.
+  private CompletableFuture<Optional<KeySelector>> getEndOfQueueKeyExclusive() {
     return database.runAsync(
         transaction -> transaction.getRange(deviceQueueSubspace.range(), 1, true, StreamingMode.EXACT).asList()
             .thenApply(items -> {
@@ -98,6 +166,100 @@ public class FoundationDbMessageStream implements MessageStream {
 
   @Override
   public CompletableFuture<Void> acknowledgeMessage(final MessageProtos.Envelope message) {
-    throw new UnsupportedOperationException("Not implemented");
+    handleAcknowledged(messageGuidCodec.decodeMessageGuid(UUIDUtil.fromByteString(message.getServerGuidBinary())));
+    return CompletableFuture.completedFuture(null);
+  }
+
+  @VisibleForTesting
+  synchronized void handleAcknowledged(final Versionstamp versionstamp) {
+    // If we don't know about this versionstamp, or it's already acknowledged, there's nothing to do
+    if (!sentVersionstamps.containsKey(versionstamp) || sentVersionstamps.get(versionstamp)) {
+      return;
+    }
+
+    unacknowledgedMessages--;
+    sentVersionstamps.put(versionstamp, true);
+  }
+
+  /// Returns the number of unacknowledged messages after sending the provided versionstamp
+  ///
+  /// @param versionstamp The versionstamp being sent
+  @VisibleForTesting
+  synchronized int onVersionstampSent(final Versionstamp versionstamp) {
+    sentVersionstamps.put(versionstamp, false);
+    return ++unacknowledgedMessages;
+  }
+
+  /// Clear the versionstamp range (startInclusive, endInclusive) in a single FoundationDB operation.
+  ///
+  /// @param transaction    The FoundationDB transaction in which to perform the range clear
+  /// @param startInclusive The starting versionstamp of the range to be cleared (inclusive)
+  /// @param endInclusive   The ending versionstamp of the range to be cleared (inclusive)
+  private void clearRange(final Transaction transaction, final Versionstamp startInclusive, final Versionstamp endInclusive) {
+    final byte[] startKeyInclusive = deviceQueueSubspace.pack(Tuple.from(startInclusive));
+    final byte[] endKeyExclusive = ByteArrayUtil.keyAfter(deviceQueueSubspace.pack(Tuple.from(endInclusive)));
+    transaction.clear(startKeyInclusive, endKeyExclusive);
+  }
+
+  /// Clear all outstanding acknowledged messages. Called when the stream ends
+  private CompletableFuture<Void> flushAllAcknowledgedMessages() {
+    final Consumer<Transaction> clearAllAcknowlegedMessagedConsumer = clearAcknowledgedMessages();
+    return database.runAsync(transaction -> {
+          clearAllAcknowlegedMessagedConsumer.accept(transaction);
+          return CompletableFuture.completedFuture((Void) null);
+        })
+        .whenComplete((_, throwable) -> {
+          if (throwable != null) {
+            LOGGER.warn("Failed to clear acknowledged messages", throwable);
+          }
+        });
+  }
+
+  private synchronized Consumer<Transaction> clearAcknowledgedMessages() {
+    final List<Pair<Versionstamp, Versionstamp>> flushableRanges = computeFlushableRanges();
+    flushableRanges.forEach(range -> sentVersionstamps.subMap(range.first(), true, range.second(), true).clear());
+    return transaction -> flushableRanges.forEach(range -> clearRange(transaction, range.first(), range.second()));
+  }
+
+  /// Computes a list of acknowledged contiguous versionstamp ranges that can be cleared from the database.
+  ///
+  /// @return a list of acknowledged contiguous versionstamp ranges that can be cleared from the database.
+  @VisibleForTesting
+  synchronized List<Pair<Versionstamp, Versionstamp>> computeFlushableRanges() {
+    final List<Pair<Versionstamp, Versionstamp>> flushableRanges = new ArrayList<>();
+      Versionstamp startInclusive = null;
+      Versionstamp endInclusive = null;
+
+      for (final Map.Entry<Versionstamp, Boolean> entry : sentVersionstamps.entrySet()) {
+        if (entry.getValue()) {
+          // Message is acknowledged, so we can either start tracking a new range if we aren't already, or extend our
+          // current range
+          if (startInclusive == null) {
+            startInclusive = entry.getKey();
+          }
+          endInclusive = entry.getKey();
+        } else {
+          // Message is un-acknowledged, which means either it is a "range-breaker" or we never started tracking an
+          // acknowledged range. Mark the currently tracked range flushable, if it exists.
+          if (startInclusive != null) {
+            assert endInclusive != null;
+            flushableRanges.add(new Pair<>(startInclusive, endInclusive));
+            startInclusive = null;
+          }
+        }
+
+      }
+
+      if (startInclusive != null) {
+        assert endInclusive != null;
+        flushableRanges.add(new Pair<>(startInclusive, endInclusive));
+      }
+
+    return flushableRanges;
+  }
+
+  private static boolean isStaleEphemeralMessage(final MessageProtos.Envelope message,
+      long earliestAllowableTimestamp) {
+    return message.getEphemeral() && message.getClientTimestamp() < earliestAllowableTimestamp;
   }
 }

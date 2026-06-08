@@ -131,9 +131,6 @@ public class AddRemoveDeviceIntegrationTest {
     final RegistrationRecoveryPasswordsManager registrationRecoveryPasswordsManager =
         mock(RegistrationRecoveryPasswordsManager.class);
 
-    when(registrationRecoveryPasswordsManager.remove(any()))
-        .thenReturn(CompletableFuture.completedFuture(null));
-
     PUBSUB_SERVER_EXTENSION.getRedisClient().useConnection(connection -> {
       connection.sync().flushall();
       connection.sync().configSet("notify-keyspace-events", "K$");
@@ -148,6 +145,7 @@ public class AddRemoveDeviceIntegrationTest {
         keysManager,
         messagesManager,
         profilesManager,
+        mock(ChangeNumberWaitingPeriodManager.class),
         secureStorageClient,
         svr2Client,
         mock(DisconnectionRequestManager.class),

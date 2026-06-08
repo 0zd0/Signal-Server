@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -31,9 +32,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -47,6 +50,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.junitpioneer.jupiter.cartesian.CartesianTest;
 import org.whispersystems.textsecuregcm.entities.MessageProtos;
 import org.whispersystems.textsecuregcm.identity.AciServiceIdentifier;
 import org.whispersystems.textsecuregcm.storage.Device;
@@ -56,8 +60,10 @@ import org.whispersystems.textsecuregcm.storage.MessageStreamEntry;
 import org.whispersystems.textsecuregcm.util.Conversions;
 import org.whispersystems.textsecuregcm.util.TestRandomUtil;
 import org.whispersystems.textsecuregcm.util.UUIDUtil;
+import org.whispersystems.textsecuregcm.util.Util;
 import reactor.adapter.JdkFlowAdapter;
 import reactor.test.StepVerifier;
+import javax.annotation.Nullable;
 
 @Timeout(value = 5, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 class FoundationDbMessageStoreTest {
@@ -404,7 +410,8 @@ class FoundationDbMessageStoreTest {
 
     final Device device = new Device();
     device.setId(Device.PRIMARY_ID);
-    final MessageStream messageStream = foundationDbMessageStore.getMessages(aci, device, batchSize);
+    final MessageStream messageStream = foundationDbMessageStore.getMessages(aci, device, batchSize, numMessages,
+        Util.NOOP);
     final List<MessageStreamEntry> retrievedEntries = new ArrayList<>();
     StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messageStream.getMessages()))
         .recordWith(() -> retrievedEntries)
@@ -456,20 +463,19 @@ class FoundationDbMessageStoreTest {
 
     final CountDownLatch latch = new CountDownLatch(1);
     final MessageProtos.Envelope message3 = generateRandomMessage(false);
-    final AtomicReference<Versionstamp> versionstamp3 = new AtomicReference<>();
+    final CompletableFuture<Versionstamp> versionstamp3 = new CompletableFuture<>();
     Thread.ofVirtual().start(() -> {
       try {
         // Wait until queue is empty
         assertTrue(latch.await(1000, TimeUnit.MILLISECONDS));
         // Then publish more messages
-        synchronized (versionstamp3) {
-          versionstamp3.set(foundationDbMessageStore.insert(aci, Map.of(Device.PRIMARY_ID, message3)).join()
-              .get(Device.PRIMARY_ID)
-              .versionstamp()
-              .orElseThrow());
-
-          versionstamp3.notifyAll();
-        }
+        foundationDbMessageStore.insert(aci, Map.of(Device.PRIMARY_ID, message3))
+            .thenAccept(result -> {
+              result.get(Device.PRIMARY_ID)
+                  .versionstamp()
+                  .ifPresentOrElse(versionstamp3::complete,
+                      () -> versionstamp3.completeExceptionally(new RuntimeException("versionstamp absent")));
+            });
       } catch (final InterruptedException e) {
         fail(e);
       }
@@ -488,24 +494,11 @@ class FoundationDbMessageStoreTest {
             .setServerGuidBinary(UUIDUtil.toByteString(messageGuidCodec.encodeMessageGuid(versionstamp2)))
             .build()))
         .expectNext(new MessageStreamEntry.QueueEmpty())
-        .then(() -> {
-          // Trigger insertion of another message
-          latch.countDown();
-
-          // …but then wait for its versionstamp so we can verify that we have the right payload
-          synchronized (versionstamp3) {
-            while (versionstamp3.get() == null) {
-              try {
-                versionstamp3.wait();
-              } catch (final InterruptedException e) {
-                throw new RuntimeException(e);
-              }
-            }
-          }
-        })
+        // Trigger insertion of another message
+        .then(latch::countDown)
         .expectNextMatches(entry -> entry.equals(new MessageStreamEntry.Envelope(message3
             .toBuilder()
-            .setServerGuidBinary(UUIDUtil.toByteString(messageGuidCodec.encodeMessageGuid(versionstamp3.get())))
+            .setServerGuidBinary(UUIDUtil.toByteString(messageGuidCodec.encodeMessageGuid(versionstamp3.join())))
             .build())))
         .verifyTimeout(Duration.ofSeconds(3));
   }
@@ -550,21 +543,187 @@ class FoundationDbMessageStoreTest {
         .verifyTimeout(Duration.ofSeconds(3));
   }
 
-  static MessageProtos.Envelope generateRandomMessage(final boolean ephemeral) {
-    return generateRandomMessage(ephemeral, 16);
+  @ParameterizedTest
+  @MethodSource
+  void acknowledgeMessages(final int numMessages, final Set<Integer> unacknowledgedMessages)
+      throws InterruptedException {
+    final AciServiceIdentifier aci = new AciServiceIdentifier(UUID.randomUUID());
+    final MessageGuidCodec messageGuidCodec =
+        new MessageGuidCodec(aci.uuid(), Device.PRIMARY_ID, versionstampUUIDCipher);
+    writePresenceKey(aci, Device.PRIMARY_ID, 1, 5L);
+
+    final List<Versionstamp> versionstamps = IntStream.range(0, numMessages)
+        .mapToObj(
+            _ -> foundationDbMessageStore.insert(aci, Map.of(Device.PRIMARY_ID, generateRandomMessage(false))).join()
+                .get(Device.PRIMARY_ID)
+                .versionstamp()
+                .orElseThrow())
+        .toList();
+
+    final Device device = new Device();
+    device.setId(Device.PRIMARY_ID);
+    final CountDownLatch latch = new CountDownLatch(1);
+    final MessageStream messageStream = foundationDbMessageStore.getMessages(aci, device,
+        FoundationDbMessageStream.DEFAULT_MAX_MESSAGES_PER_SCAN,
+        FoundationDbMessageStream.DEFAULT_MAX_UNACKNOWLEDGED_MESSAGES,
+        latch::countDown);
+    final List<CompletableFuture<Void>> acknowledgeFutures = new ArrayList<>();
+    final AtomicInteger messageCounter = new AtomicInteger(0);
+    StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messageStream.getMessages())
+            .doOnNext(entry -> {
+              final int messageNum = messageCounter.getAndIncrement();
+              if (!unacknowledgedMessages.contains(messageNum) && entry instanceof MessageStreamEntry.Envelope(final MessageProtos.Envelope message)) {
+                acknowledgeFutures.add(messageStream.acknowledgeMessage(message));
+              }
+            }))
+        .expectNextCount(numMessages)
+        .expectNext(new MessageStreamEntry.QueueEmpty())
+        .verifyTimeout(Duration.ofSeconds(1));
+
+    CompletableFuture.allOf(acknowledgeFutures.toArray(CompletableFuture[]::new)).join();
+    final List<Versionstamp> expectedDeletedVersionstamps = IntStream.range(0, numMessages)
+        .filter(i -> !unacknowledgedMessages.contains(i))
+        .mapToObj(versionstamps::get)
+        .toList();
+    // Clean up can take a bit after subscription cancellation, so wait for the countdown latch to complete
+    if (!expectedDeletedVersionstamps.isEmpty()) {
+      assertTrue(latch.await(1, TimeUnit.SECONDS));
+      expectedDeletedVersionstamps.forEach(
+          versionstamp -> assertNull(getMessageByVersionstamp(aci, Device.PRIMARY_ID, versionstamp)));
+    }
+
+    // Expect that the unacknowledged messages are re-delivered when we connect again.
+    final List<Versionstamp> expectedRedeliveredVersionstamps = IntStream.range(0, numMessages)
+        .filter(unacknowledgedMessages::contains)
+        .mapToObj(versionstamps::get)
+        .toList();
+    final List<MessageStreamEntry> retrievedEntries = new ArrayList<>();
+    StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messageStream.getMessages()))
+        .recordWith(() -> retrievedEntries)
+        .expectNextCount(expectedRedeliveredVersionstamps.size())
+        .expectNext(new MessageStreamEntry.QueueEmpty())
+        .verifyTimeout(Duration.ofSeconds(1));
+
+    assertEquals(expectedRedeliveredVersionstamps, retrievedEntries.stream()
+        .filter(e -> e instanceof MessageStreamEntry.Envelope)
+        .map(e -> messageGuidCodec.decodeMessageGuid(UUIDUtil.fromByteString(((MessageStreamEntry.Envelope) e).message().getServerGuidBinary())))
+        .toList());
+
+  }
+
+  static Stream<Arguments> acknowledgeMessages() {
+    return Stream.of(
+        Arguments.argumentSet("Single acknowledged message", 1, Collections.emptySet()),
+        Arguments.argumentSet("Multiple messages, all acknowledged", 16, Collections.emptySet()),
+        Arguments.argumentSet("Multiple messages, single unacknowledged", 16, Set.of(3)),
+        Arguments.argumentSet("Multiple messages with range-breakers", 16, Set.of(3, 7, 8, 9, 12))
+    );
+  }
+
+  @Test
+  void outstandingUnacknowledgedMessages() {
+    final int numMessages = 5;
+    final int maxUnacknowledgedMessages = 3;
+
+    final AciServiceIdentifier aci = new AciServiceIdentifier(UUID.randomUUID());
+    writePresenceKey(aci, Device.PRIMARY_ID, 1, 5L);
+
+    final List<Versionstamp> versionstamps = IntStream.range(0, numMessages)
+        .mapToObj(
+            _ -> foundationDbMessageStore.insert(aci, Map.of(Device.PRIMARY_ID, generateRandomMessage(false))).join()
+                .get(Device.PRIMARY_ID)
+                .versionstamp()
+                .orElseThrow())
+        .toList();
+
+    final Device device = new Device();
+    device.setId(Device.PRIMARY_ID);
+    final MessageStream messageStream = foundationDbMessageStore.getMessages(aci, device,
+        FoundationDbMessageStream.DEFAULT_MAX_MESSAGES_PER_SCAN,
+        maxUnacknowledgedMessages,
+        Util.NOOP);
+
+    StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messageStream.getMessages()), numMessages)
+        .expectNextCount(maxUnacknowledgedMessages)
+        .expectError(TooManyUnacknowledgedMessagesException.class)
+        .verify();
+  }
+
+  @CartesianTest
+  void discardStaleEphemeralMessages(
+      @CartesianTest.Values(booleans = {true, false}) final boolean isStale,
+      @CartesianTest.Values(booleans = {true, false}) final boolean ephemeral) {
+    final AciServiceIdentifier aci = new AciServiceIdentifier(UUID.randomUUID());
+    writePresenceKey(aci, Device.PRIMARY_ID, 1, 5L);
+
+    final long messageTimestamp;
+    if (isStale) {
+      messageTimestamp = CLOCK.instant().minus(FoundationDbMessageStream.MAX_EPHEMERAL_MESSAGE_DELAY.plus(Duration.ofMillis(1))).toEpochMilli();
+    } else {
+      messageTimestamp = CLOCK.instant().toEpochMilli();
+    }
+
+    final Versionstamp expectedVersionstamp = foundationDbMessageStore.insert(aci, Map.of(Device.PRIMARY_ID, generateRandomMessage(ephemeral, messageTimestamp)))
+        .join()
+        .get(Device.PRIMARY_ID)
+        .versionstamp()
+        .orElseThrow();
+
+    final Device device = new Device();
+    device.setId(Device.PRIMARY_ID);
+    final MessageStream messageStream = foundationDbMessageStore.getMessages(aci, device);
+    final List<MessageStreamEntry> retrievedEntries = new ArrayList<>();
+
+    if (isStale && ephemeral) {
+      StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messageStream.getMessages()))
+          .recordWith(() -> retrievedEntries)
+          .expectNext(new MessageStreamEntry.QueueEmpty())
+          .verifyTimeout(Duration.ofSeconds(1));
+      assertEquals(1, retrievedEntries.size());
+    } else {
+      StepVerifier.create(JdkFlowAdapter.flowPublisherToFlux(messageStream.getMessages()))
+          .recordWith(() -> retrievedEntries)
+          .expectNextCount(1)
+          .expectNext(new MessageStreamEntry.QueueEmpty())
+          .verifyTimeout(Duration.ofSeconds(1));
+
+      assertEquals(2, retrievedEntries.size());
+
+      final MessageGuidCodec messageGuidCodec =
+          new MessageGuidCodec(aci.uuid(), Device.PRIMARY_ID, versionstampUUIDCipher);
+      final MessageStreamEntry.Envelope envelopeEntry =
+          assertInstanceOf(MessageStreamEntry.Envelope.class, retrievedEntries.getFirst());
+      assertEquals(expectedVersionstamp,
+          messageGuidCodec.decodeMessageGuid(UUIDUtil.fromByteString(envelopeEntry.message().getServerGuidBinary())));
+    }
+  }
+
+  static MessageProtos.Envelope generateRandomMessage(final boolean ephemeral, final long timestamp) {
+    return generateRandomMessage(ephemeral, 16, timestamp);
   }
 
   static MessageProtos.Envelope generateRandomMessage(final boolean ephemeral, final int contentSize) {
+    return generateRandomMessage(ephemeral, contentSize, CLOCK.millis());
+  }
+
+  static MessageProtos.Envelope generateRandomMessage(final boolean ephemeral) {
+    return generateRandomMessage(ephemeral, 16, CLOCK.millis());
+  }
+
+  static MessageProtos.Envelope generateRandomMessage(final boolean ephemeral, final int contentSize, final long timestamp) {
     return MessageProtos.Envelope.newBuilder()
+        .setClientTimestamp(timestamp)
+        .setServerTimestamp(timestamp)
         .setContent(ByteString.copyFrom(TestRandomUtil.nextBytes(contentSize)))
         .setEphemeral(ephemeral)
         .build();
   }
 
+  @Nullable
   private byte[] getMessageByVersionstamp(final AciServiceIdentifier aci, final byte deviceId,
       final Versionstamp versionstamp) {
     return foundationDbMessageStore.getShardForAci(aci).read(transaction -> {
-      final byte[] key = foundationDbMessageStore.getDeviceQueueSubspace(aci, deviceId)
+      final byte[] key = FoundationDbMessageStore.getDeviceQueueSubspace(aci, deviceId)
           .pack(Tuple.from(versionstamp));
       return transaction.get(key);
     }).join();
@@ -572,7 +731,7 @@ class FoundationDbMessageStoreTest {
 
   private Optional<Versionstamp> getMessagesAvailableWatch(final AciServiceIdentifier aci) {
     return foundationDbMessageStore.getShardForAci(aci)
-        .read(transaction -> transaction.get(foundationDbMessageStore.getMessagesAvailableWatchKey(aci))
+        .read(transaction -> transaction.get(FoundationDbMessageStore.getMessagesAvailableWatchKey(aci))
             .thenApply(value -> value == null ? null : Tuple.fromBytes(value).getVersionstamp(0))
             .thenApply(Optional::ofNullable))
         .join();
@@ -609,7 +768,7 @@ class FoundationDbMessageStoreTest {
 
   private List<KeyValue> getItemsInDeviceQueue(final AciServiceIdentifier aci, final byte deviceId) {
     return foundationDbMessageStore.getShardForAci(aci).readAsync(transaction -> AsyncUtil.collect(transaction.getRange(
-        foundationDbMessageStore.getDeviceQueueSubspace(aci, deviceId).range()))).join();
+        FoundationDbMessageStore.getDeviceQueueSubspace(aci, deviceId).range()))).join();
   }
 
 }

@@ -22,6 +22,7 @@ import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.ServiceUnavailableException;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Context;
@@ -75,7 +76,7 @@ public class AccountControllerV2 {
   @ApiResponse(responseCode = "423", content = @Content(schema = @Schema(implementation = RegistrationLockFailure.class)))
   @ApiResponse(responseCode = "429", description = "Too many attempts", headers = @Header(
       name = "Retry-After",
-      description = "If present, an positive integer indicating the number of seconds before a subsequent attempt could succeed"))
+      description = "If present, a positive integer indicating the number of seconds before a subsequent attempt could succeed"))
   public AccountIdentityResponse changeNumber(@Auth final AuthenticatedDevice authenticatedDevice,
       @NotNull @Valid final ChangeNumberRequest request,
       @HeaderParam(HttpHeaders.USER_AGENT) final String userAgentString,
@@ -121,6 +122,8 @@ public class AccountControllerV2 {
       throw new BadRequestException(e);
     } catch (final MessageTooLargeException e) {
       throw new WebApplicationException(Response.Status.REQUEST_ENTITY_TOO_LARGE);
+    } catch (final MessageDeliveryNotAllowedException e) {
+      throw new ServiceUnavailableException();
     }
   }
 

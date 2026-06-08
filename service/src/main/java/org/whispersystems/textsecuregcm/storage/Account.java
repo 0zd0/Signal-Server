@@ -4,16 +4,28 @@
  */
 package org.whispersystems.textsecuregcm.storage;
 
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.fasterxml.jackson.annotation.JsonFilter;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonDeserializer;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.SerializerProvider;
 import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import io.micrometer.core.instrument.Metrics;
+import io.micrometer.core.instrument.Tags;
+import java.io.IOException;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Collections;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -80,7 +92,8 @@ public class Account {
   private IdentityKey phoneNumberIdentityKey;
 
   @JsonProperty("cpv")
-  private String currentProfileVersion;
+  @JsonDeserialize(using = ProfileVersionAdapter.Deserializing.class)
+  private byte[] currentProfileVersion;
 
   @JsonProperty
   private List<AccountBadge> badges = new ArrayList<>();
@@ -116,6 +129,10 @@ public class Account {
   @JsonProperty("zck")
   @Nullable
   private byte[] zkCredentialKey;
+
+  @JsonProperty("zckr")
+  @Nullable
+  private Long zkCredentialKeyRotationId;
 
   @JsonProperty
   private int version;
@@ -323,13 +340,13 @@ public class Account {
         .orElse(0L);
   }
 
-  public Optional<String> getCurrentProfileVersion() {
+  public Optional<byte[]> getCurrentProfileVersion() {
     requireNotStale();
 
     return Optional.ofNullable(currentProfileVersion);
   }
 
-  public void setCurrentProfileVersion(final String currentProfileVersion) {
+  public void setCurrentProfileVersion(final byte[] currentProfileVersion) {
     requireNotStale();
 
     this.currentProfileVersion = currentProfileVersion;
@@ -552,6 +569,15 @@ public class Account {
     this.zkCredentialKey = zkCredentialKey;
   }
 
+  @Nullable
+  public Long getZkCredentialKeyRotationId() {
+    return zkCredentialKeyRotationId;
+  }
+
+  public void setZkCredentialKeyRotationId(@Nullable final Long zkCredentialKeyRotationId) {
+    this.zkCredentialKeyRotationId = zkCredentialKeyRotationId;
+  }
+
   public void markStale() {
     stale = true;
   }
@@ -562,6 +588,23 @@ public class Account {
     //noinspection ConstantConditions
     if (stale) {
       logger.error("Accessor called on stale account", new RuntimeException());
+    }
+  }
+
+  private static class ProfileVersionAdapter {
+    private static class Deserializing extends JsonDeserializer<byte[]> {
+      private static final String CURRENT_PROFILE_VERSION_FORMAT_COUNTER_NAME = name(Account.class, "currentProfileMetricDeserialized");
+
+      @Override
+      public byte[] deserialize(JsonParser jsonParser, DeserializationContext deserializationContext) throws IOException {
+        final String val = jsonParser.getValueAsString();
+        Metrics.counter(CURRENT_PROFILE_VERSION_FORMAT_COUNTER_NAME, Tags.of("format", val.length() == 64 ? "hex" : "base64")).increment();
+        if (val.length() == 64) {
+          return HexFormat.of().parseHex(val);
+        } else {
+          return Base64.getDecoder().decode(val);
+        }
+      }
     }
   }
 }

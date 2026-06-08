@@ -92,6 +92,8 @@ dynamoDbTables:
     tableName: Example_AppleDeviceCheckPublicKeys
   backups:
     tableName: Example_Backups
+  changeNumberWaitingPeriods:
+    tableName: Example_ChangeNumberWaitingPeriods
   clientReleases:
     tableName: Example_ClientReleases
   deletedAccounts:
@@ -146,8 +148,6 @@ dynamoDbTables:
     expiration: P7D
   subscriptions:
     tableName: Example_Subscriptions
-  clientPublicKeys:
-    tableName: Example_ClientPublicKeys
   verificationSessions:
     tableName: Example_VerificationSessions
 
@@ -234,7 +234,8 @@ messageCache: # Redis server configuration for message store cache
     configurationUri: redis://redis.example.com:6379/
 
 attachments:
-  maxUploadSizeInBytes: 1024
+  maxAttachmentUploadSizeInBytes: 1024
+  maxMessageBackupUploadSizeInBytes: 1024
 
 gcpAttachments: # GCP Storage configuration
   domain: example.com
@@ -516,6 +517,7 @@ idlePrimaryDeviceReminder:
 
 grpc:
   port: 50051
+  websocketPort: 8080
 
 asnTable:
   s3Region: a-region

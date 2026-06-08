@@ -7,13 +7,12 @@ package org.whispersystems.textsecuregcm.grpc;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.when;
 
-import com.google.common.collect.Iterators;
 import com.google.protobuf.ByteString;
 import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
@@ -28,16 +27,12 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-import java.util.stream.Stream;
 import org.apache.commons.collections4.IteratorUtils;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.Arguments;
-import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
-import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junitpioneer.jupiter.cartesian.CartesianTest;
 import org.mockito.Mock;
@@ -79,7 +74,8 @@ import reactor.core.publisher.Flux;
 class BackupsAnonymousGrpcServiceTest extends
     SimpleBaseGrpcTest<BackupsAnonymousGrpcService, BackupsAnonymousGrpc.BackupsAnonymousBlockingStub> {
 
-  private static final long MAX_MESSAGE_BACKUP_OBJECT_SIZE = 100;
+  private static final long MAX_ATTACHMENT_OBJECT_SIZE = 100;
+  private static final long MAX_MESSAGE_BACKUP_OBJECT_SIZE = 200;
 
   private final UUID aci = UUID.randomUUID();
   private final byte[] messagesBackupKey = TestRandomUtil.nextBytes(32);
@@ -92,7 +88,7 @@ class BackupsAnonymousGrpcServiceTest extends
 
   @Override
   protected BackupsAnonymousGrpcService createServiceBeforeEachTest() {
-    return new BackupsAnonymousGrpcService(backupManager, new BackupMetrics(), MAX_MESSAGE_BACKUP_OBJECT_SIZE);
+    return new BackupsAnonymousGrpcService(backupManager, new BackupMetrics(), MAX_ATTACHMENT_OBJECT_SIZE, MAX_MESSAGE_BACKUP_OBJECT_SIZE);
   }
 
   @BeforeEach
@@ -112,6 +108,16 @@ class BackupsAnonymousGrpcServiceTest extends
         .setSignedPresentation(signedPresentation(presentation))
         .build())
         .getResponseCase()).isEqualTo(SetPublicKeyResponse.ResponseCase.SUCCESS);
+  }
+
+  @Test
+  void setPublicKeyBadZkAuth() throws BackupFailedZkAuthenticationException {
+    doThrow(BackupFailedZkAuthenticationException.class).when(backupManager).setPublicKey(any(), any(), any());
+    assertThat(unauthenticatedServiceStub().setPublicKey(SetPublicKeyRequest.newBuilder()
+            .setPublicKey(ByteString.copyFrom(ECKeyPair.generate().getPublicKey().serialize()))
+            .setSignedPresentation(signedPresentation(presentation))
+            .build())
+        .getResponseCase()).isEqualTo(SetPublicKeyResponse.ResponseCase.FAILED_AUTHENTICATION);
   }
 
   @Test
@@ -340,25 +346,27 @@ class BackupsAnonymousGrpcServiceTest extends
   @EnumSource(value = GetUploadFormRequest.UploadTypeCase.class, names = "UPLOADTYPE_NOT_SET", mode = EnumSource.Mode.EXCLUDE)
   public void uploadForm(GetUploadFormRequest.UploadTypeCase uploadType)
       throws BackupException, RateLimitExceededException {
-    final long uploadLength = 100;
     final BackupUploadDescriptor result =
         new BackupUploadDescriptor(3, "abc", Map.of("k", "v"), "example.org");
     final GetUploadFormRequest.Builder builder = switch (uploadType) {
       case MESSAGES -> {
-        when(backupManager.createMessageBackupUploadDescriptor(any(), eq(uploadLength)))
+        when(backupManager.createMessageBackupUploadDescriptor(any(), eq(MAX_MESSAGE_BACKUP_OBJECT_SIZE)))
             .thenReturn(result);
-        yield GetUploadFormRequest.newBuilder().setMessages(GetUploadFormRequest.MessagesUploadType.getDefaultInstance());
+        yield GetUploadFormRequest.newBuilder()
+            .setMessages(GetUploadFormRequest.MessagesUploadType.getDefaultInstance())
+            .setUploadLength(MAX_MESSAGE_BACKUP_OBJECT_SIZE);
       }
       case MEDIA -> {
-        when(backupManager.createTemporaryAttachmentUploadDescriptor(any(), eq(uploadLength)))
+        when(backupManager.createTemporaryAttachmentUploadDescriptor(any(), eq(MAX_ATTACHMENT_OBJECT_SIZE)))
             .thenReturn(result);
-        yield GetUploadFormRequest.newBuilder().setMedia(GetUploadFormRequest.MediaUploadType.getDefaultInstance());
+        yield GetUploadFormRequest.newBuilder()
+            .setMedia(GetUploadFormRequest.MediaUploadType.getDefaultInstance())
+            .setUploadLength(MAX_ATTACHMENT_OBJECT_SIZE);
       }
       default -> throw new IllegalArgumentException("Unknown upload type: " + uploadType);
     };
     final GetUploadFormRequest request = builder
         .setSignedPresentation(signedPresentation(presentation))
-        .setUploadLength(uploadLength)
         .build();
     final GetUploadFormResponse response = unauthenticatedServiceStub().getUploadForm(request);
       assertThat(response.getUploadForm().getCdn()).isEqualTo(3);
@@ -372,14 +380,15 @@ class BackupsAnonymousGrpcServiceTest extends
   public void uploadFormExceedsMax(GetUploadFormRequest.UploadTypeCase uploadType) throws BackupException {
     final GetUploadFormRequest.Builder builder = switch (uploadType) {
       case MESSAGES -> GetUploadFormRequest.newBuilder()
+          .setUploadLength(MAX_MESSAGE_BACKUP_OBJECT_SIZE + 1)
           .setMessages(GetUploadFormRequest.MessagesUploadType.getDefaultInstance());
       case MEDIA -> GetUploadFormRequest.newBuilder()
+          .setUploadLength(MAX_ATTACHMENT_OBJECT_SIZE + 1)
           .setMedia(GetUploadFormRequest.MediaUploadType.getDefaultInstance());
       default -> throw new IllegalArgumentException("Unknown upload type: " + uploadType);
     };
     final GetUploadFormRequest request = builder
         .setSignedPresentation(signedPresentation(presentation))
-        .setUploadLength(MAX_MESSAGE_BACKUP_OBJECT_SIZE + 1)
         .build();
 
     final GetUploadFormResponse response = unauthenticatedServiceStub().getUploadForm(request);
