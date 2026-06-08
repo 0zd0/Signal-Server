@@ -1,14 +1,9 @@
 name: Build and Push Docker Image
 
 on:
-  push:
-    branches:
-      - main
+  release:
+    types: [published]
   workflow_dispatch:
-
-env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
 
 jobs:
   build-and-push:
@@ -20,19 +15,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # 6.0.2
 
+      - name: Set up JDK
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # 5.2.0
+        with:
+          distribution: 'temurin'
+          java-version-file: .java-version
+          cache: 'maven'
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@99214aa6889fcddfa57764031d71add364327e59 # 6.1.3
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
 
       - name: Get CodeArtifact Token
         id: get-token
+        env:
+          CA_DOMAIN: ${{ vars.CA_DOMAIN }}
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
         run: |
           TOKEN=$(aws codeartifact get-authorization-token \
-            --domain ${{ vars.CA_DOMAIN }} \
-            --domain-owner ${{ vars.AWS_ACCOUNT_ID }} \
-            --region ${{ env.AWS_REGION }} \
+            --domain "$CA_DOMAIN" \
+            --domain-owner "$AWS_ACCOUNT_ID" \
+            --region "$AWS_REGION" \
             --query authorizationToken \
             --output text)
           
@@ -43,17 +49,13 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@fa648b43de3d4d023bcb3f89ed6940096949c419 # 2.1.5
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
-
-      - name: Build and push image to Amazon ECR
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
-        with:
-          context: .
-          file: .infra/Dockerfile
-          push: true
-          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          secrets: |
-            "codeartifact_token=${{ steps.get-token.outputs.token }}"
+      - name: Build and push container image
+        env:
+          CODEARTIFACT_AUTH_TOKEN: ${{ steps.get-token.outputs.token }}
+        run: |
+          ./mvnw -s settings.xml -B compile jib:build \
+            -Pexclude-spam-filter \
+            -pl service \
+            -am \
+            -Djib.to.image="${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}" \
+            -Djib.to.tags="${{ github.ref_name }}"
