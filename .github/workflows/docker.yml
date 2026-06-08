@@ -53,9 +53,9 @@ jobs:
         env:
           CODEARTIFACT_AUTH_TOKEN: ${{ steps.get-token.outputs.token }}
         run: |
-          ./mvnw -s settings.xml -B compile jib:build \
+          ./mvnw -s settings.xml -B deploy \
             -Pexclude-spam-filter \
-            -pl service \
-            -am \
+            -DskipTests \
+            -Dproperties.skip=true \
             -Djib.to.image="${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}" \
             -Djib.to.tags="${{ github.ref_name }}"
