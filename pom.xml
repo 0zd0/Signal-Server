@@ -17,7 +17,7 @@
     <repository>
       <id>letknowmessenger-maven</id>
       <name>LetKnowMessenger Build Artifacts</name>
-      <url>https://letknowmessenger-598120810919.d.codeartifact.ap-southeast-1.amazonaws.com/maven/maven/</url>
+      <url>https://letknowmessenger-349687197046.d.codeartifact.eu-central-1.amazonaws.com/maven/maven/</url>
       <snapshots>
         <enabled>false</enabled>
       </snapshots>
